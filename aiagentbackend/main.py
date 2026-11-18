@@ -4,12 +4,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import mimetypes
 import bcrypt, jwt, psycopg
+
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel
+from agent import run_agent
 BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR / "storage"
 load_dotenv()
@@ -226,37 +229,117 @@ def health():
     return {"status": "ok"}
 
 
-# ---------------- Assets ----------------
+# ---------------- Content jobs (AI agent) ----------------
+class JobIn(BaseModel):
+    instruction: str
+    brief: str
 
-@app.get("/api/assets/{asset_id}")
+
+def get_job_or_404(job_id: int, user: dict):
+    with pool.connection() as conn:
+        job = conn.execute(
+            "SELECT id, owner_id, status, instruction, seo_title, description, hashtags, "
+            "copy_by_platform, created_at FROM content_jobs WHERE id = %s",
+            (job_id,),
+        ).fetchone()
+    if not job or (job["owner_id"] != user["id"] and user["role"] != "manager"):
+        raise HTTPException(404, "Job not found.")
+    return job
+
+
+@app.post("/api/jobs")
+def create_job(body: JobIn, background: BackgroundTasks, user=Depends(current_user)):
+    instruction, brief = body.instruction.strip(), body.brief.strip()
+    if not 5 <= len(instruction) <= 1000:
+        raise HTTPException(400, "Instruction must be 5 to 1000 characters.")
+    if not 10 <= len(brief) <= 8000:
+        raise HTTPException(400, "Brief must be 10 to 8000 characters.")
+    with pool.connection() as conn:
+        recent = conn.execute(
+            "SELECT COUNT(*) AS n FROM content_jobs WHERE owner_id=%s AND created_at > NOW() - INTERVAL '1 hour'",
+            (user["id"],),
+        ).fetchone()["n"]
+        if recent >= 10:
+            raise HTTPException(429, "Too many jobs this hour. Try again later.")
+        job = conn.execute(
+            "INSERT INTO content_jobs (owner_id, instruction, brief, status) VALUES (%s,%s,%s,'generating') RETURNING id",
+            (user["id"], instruction, brief),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO audit_log (actor_id, action, job_id) VALUES (%s,'job_created',%s)",
+            (user["id"], job["id"]),
+        )
+    background.add_task(run_agent, pool, job["id"])
+    return {"id": job["id"]}
+
+
+@app.get("/api/jobs/{job_id}")
+def read_job(job_id: int, user=Depends(current_user)):
+    job = get_job_or_404(job_id, user)
+    with pool.connection() as conn:
+        steps = conn.execute(
+            "SELECT id, step_no, tool_name, status, output FROM job_steps WHERE job_id=%s ORDER BY step_no",
+            (job_id,),
+        ).fetchall()
+        assets = conn.execute(
+            "SELECT id, kind FROM assets WHERE job_id=%s ORDER BY id", (job_id,)
+        ).fetchall()
+    return {**job, "steps": steps, "assets": assets}
+
+
+# ---------------- Assets (images and videos) ----------------
+@app.get("/api/assets/{asset_id}/file")
 def asset_file(asset_id: int, user=Depends(current_user)):
     with pool.connection() as conn:
         asset = conn.execute(
-            """
-            SELECT a.storage_path, a.kind
-            FROM assets a
-            JOIN content_jobs j ON j.id = a.job_id
-            WHERE a.id = %s
-            """,
+            "SELECT a.storage_path, a.kind, j.owner_id FROM assets a "
+            "JOIN content_jobs j ON j.id = a.job_id WHERE a.id = %s",
             (asset_id,),
         ).fetchone()
 
-    if not asset:
-        raise HTTPException(404, "Asset not found")
+    # same answer for "missing" and "not yours", so nobody can probe which IDs exist
+    if not asset or (asset["owner_id"] != user["id"] and user["role"] != "manager"):
+        raise HTTPException(404, "Not found.")
 
     path = (STORAGE_DIR / asset["storage_path"]).resolve()
+    if not path.is_relative_to(STORAGE_DIR.resolve()) or not path.is_file():
+        raise HTTPException(404, "Not found.")
 
-    if not path.is_relative_to(STORAGE_DIR.resolve()):
-        raise HTTPException(403, "Invalid asset path")
-
-    if not path.is_file():
-        raise HTTPException(404, "Asset file not found")
-
-    media = (
-        "video/mp4"
-        if asset["kind"] == "video"
-        else (mimetypes.guess_type(str(path))[0] or "image/jpeg")
-    )
-
-    media = "video/mp4" if a["kind"] == "video" else (mimetypes.guess_type(str(path))[0] or "image/jpeg")
+    media = "video/mp4" if asset["kind"] == "video" else (mimetypes.guess_type(str(path))[0] or "image/jpeg")
     return FileResponse(path, media_type=media)
+
+
+# # ---------------- Assets ----------------
+
+# @app.get("/api/assets/{asset_id}")
+# def asset_file(asset_id: int, user=Depends(current_user)):
+#     with pool.connection() as conn:
+#         asset = conn.execute(
+#             """
+#             SELECT a.storage_path, a.kind
+#             FROM assets a
+#             JOIN content_jobs j ON j.id = a.job_id
+#             WHERE a.id = %s
+#             """,
+#             (asset_id,),
+#         ).fetchone()
+
+#     if not asset:
+#         raise HTTPException(404, "Asset not found")
+
+#     path = (STORAGE_DIR / asset["storage_path"]).resolve()
+
+#     if not path.is_relative_to(STORAGE_DIR.resolve()):
+#         raise HTTPException(403, "Invalid asset path")
+
+#     if not path.is_file():
+#         raise HTTPException(404, "Asset file not found")
+
+#     media = (
+#         "video/mp4"
+#         if asset["kind"] == "video"
+#         else (mimetypes.guess_type(str(path))[0] or "image/jpeg")
+#     )
+
+#     media = "video/mp4" if a["kind"] == "video" else (mimetypes.guess_type(str(path))[0] or "image/jpeg")
+#     return FileResponse(path, media_type=media)

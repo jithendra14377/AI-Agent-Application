@@ -25,7 +25,7 @@ export default function DashboardPage() {
           </div>
         ))}
       </div>
-      <Link href="/workflow" className="mt-6 inline-block rounded-lg bg-purple-600/50 px-4 py-2 text-sm">Open workflow</Link>
+      <Link href="/app/workflow" className="mt-6 inline-block rounded-lg bg-purple-600/50 px-4 py-2 text-sm">Open workflow</Link>
     </div>
   );
 }

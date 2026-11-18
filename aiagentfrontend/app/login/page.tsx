@@ -23,8 +23,13 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false);
 
   // Auto-login: if the cookie is still valid, go straight to the dashboard
+  // useEffect(() => {
+  //   api("/auth/me").then(() => router.replace("/dashboard")).catch(() => {});
+  // }, [router]);
   useEffect(() => {
-    api("/auth/me").then(() => router.replace("/dashboard")).catch(() => {});
+  api("/auth/me")
+    .then(() => router.replace("/app/dashboard"))
+    .catch(() => {});
   }, [router]);
 
   async function onSubmit(e: React.FormEvent) {
@@ -33,7 +38,7 @@ export default function LoginPage() {
     setLoading(true);
     try {
       await api("/auth/login", { method: "POST", body: JSON.stringify({ email, password, remember }) });
-      router.push("/dashboard");
+      router.replace("/app/dashboard");
     } catch (err) {
       const x = err as { status?: number; message: string };
       setError(x.status === 401 ? "Incorrect username or password" : x.message);

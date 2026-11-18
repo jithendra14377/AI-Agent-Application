@@ -8,11 +8,28 @@ import { api } from "@/lib/api";
 
 type User = { name: string; email: string; plan: string };
 
-const TOP = [["Dashboard", "/dashboard"], ["Workflow", "/workflow"], ["Content", "/content"], ["Calendar", "/calendar"], ["Analytics", "/analytics"]] as const;
+// const TOP = [["Dashboard", "/dashboard"], ["Workflow", "/workflow"], ["Content", "/content"], ["Calendar", "/calendar"], ["Analytics", "/analytics"]] as const;
+// const SIDE = [
+//   [Home, "Home", "/dashboard"], [Bot, "Agents", "/workflow"], [FileText, "Content", "/content"],
+//   [Calendar, "Calendar", "/calendar"], [BarChart3, "Analytics", "/analytics"],
+//   [Plug, "Integrations", "/integrations"], [Settings, "Settings", "/settings"],
+// ] as const;
+const TOP = [
+  ["Dashboard", "/app/dashboard"],
+  ["Workflow", "/app/workflow"],
+  ["Content", "/app/content"],
+  ["Calendar", "/app/calendar"],
+  ["Analytics", "/app/analytics"],
+] as const;
+
 const SIDE = [
-  [Home, "Home", "/dashboard"], [Bot, "Agents", "/workflow"], [FileText, "Content", "/content"],
-  [Calendar, "Calendar", "/calendar"], [BarChart3, "Analytics", "/analytics"],
-  [Plug, "Integrations", "/integrations"], [Settings, "Settings", "/settings"],
+  [Home, "Home", "/app/dashboard"],
+  [Bot, "Agents", "/app/workflow"],
+  [FileText, "Content", "/app/content"],
+  [Calendar, "Calendar", "/app/calendar"],
+  [BarChart3, "Analytics", "/app/analytics"],
+  [Plug, "Integrations", "/app/integrations"],
+  [Settings, "Settings", "/app/settings"],
 ] as const;
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {

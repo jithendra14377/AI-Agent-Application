@@ -1,3 +1,5 @@
+// 
+
 "use client";
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -13,6 +15,7 @@ type Job = {
 const LABEL: Record<string, string> = {
   write_copy: "Writing SEO title, description and hashtags",
   generate_image: "Generating image",
+  generate_video: "Building short video",
   submit_for_approval: "Submitting for manager approval",
   agent_error: "Agent error",
 };
@@ -43,7 +46,8 @@ export default function ContentPage() {
         if (stop) return;
         setJob(j);
         if (j.status !== "generating") return;
-      } catch {
+      } catch (e) {
+        setError("Could not load the job: " + (e as Error).message);
         return;
       }
       timer = setTimeout(tick, 1500);
@@ -58,9 +62,7 @@ export default function ContentPage() {
       const { id } = await api<{ id: number }>("/jobs", { method: "POST", body: JSON.stringify({ instruction, brief }) });
       setJobId(id);
     } catch (e) {
-        setError("Could not load the job: " + (e as Error).message);
-        return;
-    //   setError((e as Error).message);
+      setError((e as Error).message);
     } finally {
       setStarting(false);
     }
@@ -75,7 +77,7 @@ export default function ContentPage() {
         <p className="mb-4 text-sm text-violet-200/70">The agent drafts everything. A manager must approve before anything is posted.</p>
         <label className="mb-1 block text-sm">Instruction for the agent</label>
         <textarea className={`${field} mb-3 h-24`} value={instruction} onChange={(e) => setInstruction(e.target.value)}
-          placeholder="Create an image, an SEO title, a description and hashtags for this job opening." />
+          placeholder="Create an image, a short video, an SEO title, a description and hashtags for this job opening." />
         <label className="mb-1 block text-sm">Brief (job post details)</label>
         <textarea className={`${field} mb-3 h-44`} value={brief} onChange={(e) => setBrief(e.target.value)}
           placeholder="Paste the job posting details here: role, location, requirements, how to apply…" />
@@ -106,6 +108,9 @@ export default function ContentPage() {
             {job.assets.filter((a) => a.kind === "image").map((a) => (
               // eslint-disable-next-line @next/next/no-img-element
               <img key={a.id} src={`/api/assets/${a.id}/file`} alt="Generated post" className="mb-4 w-full rounded-xl" />
+            ))}
+            {job.assets.filter((a) => a.kind === "video").map((a) => (
+              <video key={a.id} controls src={`/api/assets/${a.id}/file`} className="mb-4 w-full rounded-xl" />
             ))}
             {job.seo_title && (
               <div className="space-y-3 text-sm">

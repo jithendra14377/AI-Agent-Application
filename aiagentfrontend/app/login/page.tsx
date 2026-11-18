@@ -5,11 +5,12 @@ import { Eye, EyeOff, Lock, Mail } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { api } from "@/lib/api";
-
-const ICONS = [
-  ["IG", "bg-gradient-to-br from-orange-400 via-pink-500 to-indigo-500"],
-  ["f", "bg-blue-600"], ["▶", "bg-red-600"], ["in", "bg-sky-700"], ["X", "bg-black"], ["♪", "bg-zinc-900"],
-];
+import { BrandLogo, type Brand } from "@/components/BrandLogo";
+// const ICONS = [
+//   ["IG", "bg-gradient-to-br from-orange-400 via-pink-500 to-indigo-500"],
+//   ["f", "bg-blue-600"], ["▶", "bg-red-600"], ["in", "bg-sky-700"], ["X", "bg-black"], ["♪", "bg-zinc-900"],
+// ];
+const BRANDS: Brand[] = ["instagram", "facebook", "youtube", "linkedin", "x", "tiktok"];
 const FEATURES = ["AI Content Creation", "Multi-Platform Publishing", "Smart Scheduling", "Performance Analytics"];
 
 export default function LoginPage() {
@@ -56,9 +57,12 @@ export default function LoginPage() {
         <div className="my-8 flex items-center gap-8">
           <div className="grid h-44 w-44 place-items-center rounded-full bg-gradient-to-br from-white to-violet-300 text-7xl shadow-[0_0_40px_#a855f7]">🤖</div>
           <div className="grid grid-cols-3 gap-4">
-            {ICONS.map(([t, c]) => (
+            {/* {ICONS.map(([t, c]) => (
               <div key={t} className={`grid h-14 w-14 animate-bounce place-items-center rounded-2xl font-bold shadow-[0_0_18px_#a855f7] ${c}`}>{t}</div>
-            ))}
+            ))} */}
+            {BRANDS.map((b) => (
+              <div key={b} className="animate-bounce"><BrandLogo brand={b} size={60} /></div>
+        ))}
           </div>
         </div>
         <div className="flex gap-5 text-center text-xs text-violet-200/80">

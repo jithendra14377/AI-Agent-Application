@@ -1,7 +1,8 @@
 import asyncio, os, re, time, uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
-
+from pathlib import Path
+import mimetypes
 import bcrypt, jwt, psycopg
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -9,7 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel
-
+BASE_DIR = Path(__file__).resolve().parent
+STORAGE_DIR = BASE_DIR / "storage"
 load_dotenv()
 DATABASE_URL = os.environ["DATABASE_URL"]
 SECRET = os.environ["JWT_SECRET"]
@@ -63,7 +65,7 @@ def make_token(user_id: int, days: int) -> str:
 def get_user(user_id: int):
     with pool.connection() as conn:
         return conn.execute(
-            "SELECT id, name, email, plan FROM users WHERE id = %s AND is_active",
+            "SELECT id, name, email, plan, role FROM users WHERE id = %s AND is_active",
             (user_id,),
         ).fetchone()
 
@@ -82,6 +84,10 @@ def current_user(request: Request):
         raise HTTPException(401, "Not authenticated")
     return user
 
+def require_manager(user=Depends(current_user)):
+    if user["role"] != "manager":
+        raise HTTPException(403, "Only managers can do this.")
+    return user
 
 def set_login_cookie(response: Response, user_id: int, remember: bool):
     days = 30 if remember else 1
@@ -92,9 +98,10 @@ def set_login_cookie(response: Response, user_id: int, remember: bool):
     )
 
 
+# def public(u: dict):
+#     return {"name": u["name"], "email": u["email"], "plan": u["plan"]}
 def public(u: dict):
-    return {"name": u["name"], "email": u["email"], "plan": u["plan"]}
-
+    return {"name": u["name"], "email": u["email"], "plan": u["plan"], "role": u["role"]}
 
 # ---------------- Auth ----------------
 @app.post("/api/auth/signup")
@@ -117,7 +124,7 @@ def signup(body: SignupIn, response: Response):
         with pool.connection() as conn:
             user = conn.execute(
                 "INSERT INTO users (name, email, password_hash) VALUES (%s, %s, %s) "
-                "RETURNING id, name, email, plan",
+                "RETURNING id, name, email, plan, role",
                 (name, email, pw_hash),
             ).fetchone()
     except psycopg.errors.UniqueViolation:
@@ -138,7 +145,7 @@ def login(body: LoginIn, request: Request, response: Response):
     email = body.email.strip().lower()
     with pool.connection() as conn:
         row = conn.execute(
-            "SELECT id, name, email, plan, password_hash FROM users WHERE email = %s AND is_active",
+            "SELECT id, name, email, plan, role, password_hash FROM users WHERE email = %s AND is_active",
             (email,),
         ).fetchone()
 
@@ -217,3 +224,39 @@ async def run_events(ws: WebSocket, run_id: str):
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+# ---------------- Assets ----------------
+
+@app.get("/api/assets/{asset_id}")
+def asset_file(asset_id: int, user=Depends(current_user)):
+    with pool.connection() as conn:
+        asset = conn.execute(
+            """
+            SELECT a.storage_path, a.kind
+            FROM assets a
+            JOIN content_jobs j ON j.id = a.job_id
+            WHERE a.id = %s
+            """,
+            (asset_id,),
+        ).fetchone()
+
+    if not asset:
+        raise HTTPException(404, "Asset not found")
+
+    path = (STORAGE_DIR / asset["storage_path"]).resolve()
+
+    if not path.is_relative_to(STORAGE_DIR.resolve()):
+        raise HTTPException(403, "Invalid asset path")
+
+    if not path.is_file():
+        raise HTTPException(404, "Asset file not found")
+
+    media = (
+        "video/mp4"
+        if asset["kind"] == "video"
+        else (mimetypes.guess_type(str(path))[0] or "image/jpeg")
+    )
+
+    media = "video/mp4" if a["kind"] == "video" else (mimetypes.guess_type(str(path))[0] or "image/jpeg")
+    return FileResponse(path, media_type=media)

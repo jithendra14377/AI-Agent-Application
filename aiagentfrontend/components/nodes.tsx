@@ -1,7 +1,8 @@
 import { Handle, Position, type NodeProps, type NodeTypes } from "@xyflow/react";
 import { Bot, CheckCircle2 } from "lucide-react";
+import { BrandLogo } from "@/components/BrandLogo";
 
-type D = { label: string; sub?: string; icon?: string; color?: string; status?: "running" | "done" };
+type D = { label: string; sub?: string; brand?: string; status?: "running" | "done" };
 
 const ring = (s?: string) =>
   s === "running" ? "animate-pulse ring-2 ring-cyan-300" : s === "done" ? "ring-1 ring-emerald-400" : "";
@@ -9,8 +10,8 @@ const ring = (s?: string) =>
 export function SourceNode({ data }: NodeProps) {
   const d = data as unknown as D;
   return (
-    <div className={`flex items-center gap-2 rounded-full border border-purple-400/50 bg-[#150f45] py-1 pl-1 pr-4 text-white ${ring(d.status)}`}>
-      <span className="grid h-10 w-10 place-items-center rounded-full text-sm font-bold" style={{ background: d.color }}>{d.icon}</span>
+    <div className={`flex items-center gap-3 rounded-full border border-purple-400/50 bg-[#150f45] py-1.5 pl-1.5 pr-5 text-white ${ring(d.status)}`}>
+      <BrandLogo brand={d.brand} size={44} />
       <span className="font-medium">{d.label}</span>
       {d.status === "done" && <CheckCircle2 className="h-4 w-4 text-emerald-400" />}
       <Handle type="source" position={Position.Right} />

@@ -1,7 +1,8 @@
-import base64, json, os, shutil, subprocess, urllib.error, urllib.request
+import base64, json, os, shutil, subprocess, time, urllib.error, urllib.request
 from pathlib import Path
 
-from openai import OpenAI
+# from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, InternalServerError, OpenAI, RateLimitError
 from psycopg.types.json import Jsonb
 
 STORAGE_DIR = Path(__file__).parent / "storage"
@@ -64,8 +65,24 @@ TOOLS = [
 
 
 def client() -> OpenAI:
-    return OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=os.environ["LLM_BASE_URL"], timeout=120.0, max_retries=2)
-
+    return OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=os.environ["LLM_BASE_URL"], timeout=40.0, max_retries=0)
+    # return OpenAI(api_key=os.environ["LLM_API_KEY"], base_url=os.environ["LLM_BASE_URL"], timeout=120.0, max_retries=2)
+def chat(c, model_list, state, messages):
+    """Ask the brain. Retries overloads and falls back to other models.
+    Once a model answers, we stick with it for the rest of the job."""
+    candidates = [state["model"]] if state["model"] else model_list
+    last = None
+    for m in candidates:
+        for attempt in range(2):
+            try:
+                resp = c.chat.completions.create(model=m, messages=messages, tools=TOOLS)
+                state["model"] = m
+                return resp
+            except (InternalServerError, RateLimitError, APITimeoutError, APIConnectionError) as e:
+                last = e
+                print(f"[agent] model {m} attempt {attempt + 1} failed: {type(e).__name__}")
+                time.sleep(3)
+    raise last
 
 # def fetch_image(prompt: str):
 #     """Ask a Gemini image model (same API key). Tries each model listed in IMAGE_MODELS."""
@@ -284,7 +301,10 @@ def run_agent(pool, job_id):
     try:
         with pool.connection() as conn:
             job = conn.execute("SELECT instruction, brief FROM content_jobs WHERE id=%s", (job_id,)).fetchone()
-        model = os.environ["LLM_MODEL"]
+        # model = os.environ["LLM_MODEL"]
+        # c = client()
+        model_list = [m.strip() for m in os.environ["LLM_MODEL"].split(",") if m.strip()]
+        state = {"model": None}
         c = client()
         messages = [
             {"role": "system", "content": SYSTEM},
@@ -293,7 +313,8 @@ def run_agent(pool, job_id):
 
         step_no = 0
         for _ in range(MAX_STEPS):
-            resp = c.chat.completions.create(model=model, messages=messages, tools=TOOLS)
+            resp = chat(c, model_list, state, messages)
+            # resp = c.chat.completions.create(model=model, messages=messages, tools=TOOLS)
             msg = resp.choices[0].message
             if not msg.tool_calls:
                 break
@@ -323,7 +344,9 @@ def run_agent(pool, job_id):
             fail_job(pool, job_id, "The agent stopped before submitting for approval.")
     except Exception as e:
         print(f"[agent] job {job_id} crashed: {e!r}")
-        if "429" in str(e):
-            fail_job(pool, job_id, "Free-tier rate limit reached. Wait a minute and run again.")
+        if isinstance(e, (InternalServerError, APITimeoutError, APIConnectionError)):
+            fail_job(pool, job_id, "Google's free AI service is overloaded or unreachable right now. Wait a minute and run again.")
+        elif isinstance(e, RateLimitError) or "429" in str(e):
+            fail_job(pool, job_id, "Free-tier rate limit reached on all models. Wait a minute and run again.")
         else:
             fail_job(pool, job_id, f"{type(e).__name__}: {str(e)[:200]}")

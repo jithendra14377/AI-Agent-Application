@@ -5,7 +5,9 @@ import { useEffect, useState } from "react";
 import { BarChart3, Bot, Calendar, FileText, Home, LogOut, Plug, Settings } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
+import { Poppins } from "next/font/google";
 
+const font = Poppins({ subsets: ["latin"], weight: ["400", "500", "600", "700"], variable: "--font-sans", display: "swap" });
 type User = { name: string; email: string; plan: string };
 
 // const TOP = [["Dashboard", "/dashboard"], ["Workflow", "/workflow"], ["Content", "/content"], ["Calendar", "/calendar"], ["Analytics", "/analytics"]] as const;

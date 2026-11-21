@@ -6,3 +6,5 @@ psycopg[binary]
 psycopg_pool
 python-dotenv
 openai
+pillow
+huggingface_hub

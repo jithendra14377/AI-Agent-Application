@@ -8,3 +8,5 @@ python-dotenv
 openai
 pillow
 huggingface_hub
+python-multipart
+pypdf

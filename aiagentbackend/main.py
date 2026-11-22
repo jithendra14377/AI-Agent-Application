@@ -6,7 +6,7 @@ import mimetypes
 import bcrypt, jwt, psycopg
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
@@ -247,13 +247,62 @@ def get_job_or_404(job_id: int, user: dict):
     return job
 
 
+# @app.post("/api/jobs")
+# def create_job(body: JobIn, background: BackgroundTasks, user=Depends(current_user)):
+#     instruction, brief = body.instruction.strip(), body.brief.strip()
+#     if not 5 <= len(instruction) <= 1000:
+#         raise HTTPException(400, "Instruction must be 5 to 1000 characters.")
+#     if not 10 <= len(brief) <= 8000:
+#         raise HTTPException(400, "Brief must be 10 to 8000 characters.")
+#     with pool.connection() as conn:
+#         recent = conn.execute(
+#             "SELECT COUNT(*) AS n FROM content_jobs WHERE owner_id=%s AND created_at > NOW() - INTERVAL '1 hour'",
+#             (user["id"],),
+#         ).fetchone()["n"]
+#         if recent >= 10:
+#             raise HTTPException(429, "Too many jobs this hour. Try again later.")
+#         job = conn.execute(
+#             "INSERT INTO content_jobs (owner_id, instruction, brief, status) VALUES (%s,%s,%s,'generating') RETURNING id",
+#             (user["id"], instruction, brief),
+#         ).fetchone()
+#         conn.execute(
+#             "INSERT INTO audit_log (actor_id, action, job_id) VALUES (%s,'job_created',%s)",
+#             (user["id"], job["id"]),
+#         )
+#     background.add_task(run_agent, pool, job["id"])
+#     return {"id": job["id"]}
+
+ALLOWED_UPLOADS = {".png", ".jpg", ".jpeg", ".webp", ".pdf", ".txt", ".md", ".csv"}
+MAX_FILES = 5
+MAX_FILE_BYTES = 8 * 1024 * 1024
+MAX_TOTAL_BYTES = 9 * 1024 * 1024
+
+
 @app.post("/api/jobs")
-def create_job(body: JobIn, background: BackgroundTasks, user=Depends(current_user)):
-    instruction, brief = body.instruction.strip(), body.brief.strip()
-    if not 5 <= len(instruction) <= 1000:
-        raise HTTPException(400, "Instruction must be 5 to 1000 characters.")
-    if not 10 <= len(brief) <= 8000:
-        raise HTTPException(400, "Brief must be 10 to 8000 characters.")
+async def create_job(
+    background: BackgroundTasks,
+    instruction: str = Form(...),
+    files: list[UploadFile] | None = File(default=None),
+    user=Depends(current_user),
+):
+    instruction = instruction.strip()
+    if not 5 <= len(instruction) <= 4000:
+        raise HTTPException(400, "Describe what you want to create (5 to 4000 characters).")
+    files = files or []
+    if len(files) > MAX_FILES:
+        raise HTTPException(400, f"You can attach up to {MAX_FILES} files.")
+
+    uploads, total = [], 0
+    for f in files:
+        ext = Path(f.filename or "").suffix.lower()
+        if ext not in ALLOWED_UPLOADS:
+            raise HTTPException(400, "Allowed attachments: images, PDF, TXT, MD and CSV.")
+        data = await f.read(MAX_FILE_BYTES + 1)
+        total += len(data)
+        if len(data) > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
+            raise HTTPException(400, "Attachments are too large (9 MB in total).")
+        uploads.append((ext, data))
+
     with pool.connection() as conn:
         recent = conn.execute(
             "SELECT COUNT(*) AS n FROM content_jobs WHERE owner_id=%s AND created_at > NOW() - INTERVAL '1 hour'",
@@ -262,15 +311,32 @@ def create_job(body: JobIn, background: BackgroundTasks, user=Depends(current_us
         if recent >= 10:
             raise HTTPException(429, "Too many jobs this hour. Try again later.")
         job = conn.execute(
-            "INSERT INTO content_jobs (owner_id, instruction, brief, status) VALUES (%s,%s,%s,'generating') RETURNING id",
-            (user["id"], instruction, brief),
+            "INSERT INTO content_jobs (owner_id, instruction, brief, status) VALUES (%s,%s,'','generating') RETURNING id",
+            (user["id"], instruction),
         ).fetchone()
         conn.execute(
             "INSERT INTO audit_log (actor_id, action, job_id) VALUES (%s,'job_created',%s)",
             (user["id"], job["id"]),
         )
+
+    if uploads:
+        folder = STORAGE_DIR / "uploads" / f"job_{job['id']}"
+        folder.mkdir(parents=True, exist_ok=True)
+        for i, (ext, data) in enumerate(uploads, 1):
+            (folder / f"attachment_{i}{ext}").write_bytes(data)
+
     background.add_task(run_agent, pool, job["id"])
     return {"id": job["id"]}
+
+@app.get("/api/jobs")
+def list_jobs(user=Depends(current_user)):
+    with pool.connection() as conn:
+        rows = conn.execute(
+            "SELECT id, status, seo_title, left(instruction, 100) AS instruction, created_at "
+            "FROM content_jobs WHERE owner_id = %s ORDER BY created_at DESC LIMIT 500",
+            (user["id"],),
+        ).fetchall()
+    return rows
 
 
 @app.get("/api/jobs/{job_id}")

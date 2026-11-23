@@ -1,7 +1,9 @@
 "use client";
 import { notFound, useParams } from "next/navigation";
 
-const SECTIONS = ["analytics", "integrations", "settings"];
+
+// const SECTIONS = ["agents", "analytics", "integrations", "settings"];
+const SECTIONS = ["agents", "integrations", "settings"];
 
 export default function SectionPage() {
   const { section } = useParams<{ section: string }>();

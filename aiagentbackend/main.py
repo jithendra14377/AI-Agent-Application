@@ -399,16 +399,37 @@ async def create_job(
     background.add_task(run_agent, pool, job["id"])
     return {"id": job["id"]}
 
+# @app.get("/api/jobs")
+# def list_jobs(user=Depends(current_user)):
+#     with pool.connection() as conn:
+#         rows = conn.execute(
+#             "SELECT id, status, seo_title, left(instruction, 100) AS instruction, created_at "
+#             "FROM content_jobs WHERE owner_id = %s ORDER BY created_at DESC LIMIT 500",
+#             (user["id"],),
+#         ).fetchall()
+#     return rows
+
 @app.get("/api/jobs")
 def list_jobs(user=Depends(current_user)):
     with pool.connection() as conn:
         rows = conn.execute(
-            "SELECT id, status, seo_title, left(instruction, 100) AS instruction, created_at "
-            "FROM content_jobs WHERE owner_id = %s ORDER BY created_at DESC LIMIT 500",
+            """
+            SELECT j.id, j.status, j.seo_title, left(j.instruction, 100) AS instruction, j.created_at,
+                   (SELECT a.id FROM assets a WHERE a.job_id = j.id AND a.kind = 'image'
+                    ORDER BY a.id LIMIT 1) AS thumb,
+                   (SELECT COUNT(*) FROM assets a WHERE a.job_id = j.id AND a.kind = 'image') AS images,
+                   EXISTS (SELECT 1 FROM assets a WHERE a.job_id = j.id AND a.kind = 'video') AS has_video,
+                   COALESCE((SELECT s.output->>'aspect_ratio' FROM job_steps s
+                             WHERE s.job_id = j.id AND s.tool_name = 'plan_content' AND s.status = 'done'
+                             ORDER BY s.step_no DESC LIMIT 1), '') AS aspect
+            FROM content_jobs j
+            WHERE j.owner_id = %s
+            ORDER BY j.created_at DESC
+            LIMIT 200
+            """,
             (user["id"],),
         ).fetchall()
     return rows
-
 
 @app.get("/api/jobs/{job_id}")
 def read_job(job_id: int, user=Depends(current_user)):
@@ -426,7 +447,7 @@ def read_job(job_id: int, user=Depends(current_user)):
 
 # ---------------- Assets (images and videos) ----------------
 @app.get("/api/assets/{asset_id}/file")
-def asset_file(asset_id: int, user=Depends(current_user)):
+def asset_file(asset_id: int, download: int = 0, user=Depends(current_user)):
     with pool.connection() as conn:
         asset = conn.execute(
             "SELECT a.storage_path, a.kind, j.owner_id FROM assets a "
@@ -443,7 +464,7 @@ def asset_file(asset_id: int, user=Depends(current_user)):
         raise HTTPException(404, "Not found.")
 
     media = "video/mp4" if asset["kind"] == "video" else (mimetypes.guess_type(str(path))[0] or "image/jpeg")
-    return FileResponse(path, media_type=media)
+    return FileResponse(path, media_type=media, filename=path.name if download else None)
 
 
 # # ---------------- Assets ----------------

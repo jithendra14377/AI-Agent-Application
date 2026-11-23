@@ -12,7 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel
-from agent import run_agent
+from agent import model_options, run_agent
+from content_types import CONTENT_TYPES
 BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR / "storage"
 load_dotenv()
@@ -272,22 +273,87 @@ def get_job_or_404(job_id: int, user: dict):
 #     background.add_task(run_agent, pool, job["id"])
 #     return {"id": job["id"]}
 
+@app.get("/api/content-types")
+def list_content_types(user=Depends(current_user)):
+    return [{"key": k, "label": v["label"], "hint": v["hint"]} for k, v in CONTENT_TYPES.items()]
+
+
+@app.get("/api/models")
+def list_models(user=Depends(current_user)):
+    return model_options()
+
 ALLOWED_UPLOADS = {".png", ".jpg", ".jpeg", ".webp", ".pdf", ".txt", ".md", ".csv"}
 MAX_FILES = 5
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_TOTAL_BYTES = 9 * 1024 * 1024
 
 
+# @app.post("/api/jobs")
+# async def create_job(
+#     background: BackgroundTasks,
+#     instruction: str = Form(...),
+#     files: list[UploadFile] | None = File(default=None),
+#     user=Depends(current_user),
+# ):
+#     instruction = instruction.strip()
+#     if not 5 <= len(instruction) <= 4000:
+#         raise HTTPException(400, "Describe what you want to create (5 to 4000 characters).")
+#     files = files or []
+#     if len(files) > MAX_FILES:
+#         raise HTTPException(400, f"You can attach up to {MAX_FILES} files.")
+
+#     uploads, total = [], 0
+#     for f in files:
+#         ext = Path(f.filename or "").suffix.lower()
+#         if ext not in ALLOWED_UPLOADS:
+#             raise HTTPException(400, "Allowed attachments: images, PDF, TXT, MD and CSV.")
+#         data = await f.read(MAX_FILE_BYTES + 1)
+#         total += len(data)
+#         if len(data) > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
+#             raise HTTPException(400, "Attachments are too large (9 MB in total).")
+#         uploads.append((ext, data))
+
+#     with pool.connection() as conn:
+#         recent = conn.execute(
+#             "SELECT COUNT(*) AS n FROM content_jobs WHERE owner_id=%s AND created_at > NOW() - INTERVAL '1 hour'",
+#             (user["id"],),
+#         ).fetchone()["n"]
+#         if recent >= 10:
+#             raise HTTPException(429, "Too many jobs this hour. Try again later.")
+#         job = conn.execute(
+#             "INSERT INTO content_jobs (owner_id, instruction, brief, status) VALUES (%s,%s,'','generating') RETURNING id",
+#             (user["id"], instruction),
+#         ).fetchone()
+#         conn.execute(
+#             "INSERT INTO audit_log (actor_id, action, job_id) VALUES (%s,'job_created',%s)",
+#             (user["id"], job["id"]),
+#         )
+
+#     if uploads:
+#         folder = STORAGE_DIR / "uploads" / f"job_{job['id']}"
+#         folder.mkdir(parents=True, exist_ok=True)
+#         for i, (ext, data) in enumerate(uploads, 1):
+#             (folder / f"attachment_{i}{ext}").write_bytes(data)
+
+#     background.add_task(run_agent, pool, job["id"])
+#     return {"id": job["id"]}
+
 @app.post("/api/jobs")
 async def create_job(
     background: BackgroundTasks,
     instruction: str = Form(...),
+    content_type: str = Form("auto"),
+    model: str = Form("auto"),
     files: list[UploadFile] | None = File(default=None),
     user=Depends(current_user),
 ):
     instruction = instruction.strip()
     if not 5 <= len(instruction) <= 4000:
         raise HTTPException(400, "Describe what you want to create (5 to 4000 characters).")
+    if content_type not in CONTENT_TYPES:
+        raise HTTPException(400, "Unknown content type.")
+    if model != "auto" and model not in {o["id"] for o in model_options()}:
+        raise HTTPException(400, "That model is not available.")
     files = files or []
     if len(files) > MAX_FILES:
         raise HTTPException(400, f"You can attach up to {MAX_FILES} files.")
@@ -301,7 +367,8 @@ async def create_job(
         total += len(data)
         if len(data) > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
             raise HTTPException(400, "Attachments are too large (9 MB in total).")
-        uploads.append((ext, data))
+        # uploads.append((ext, data))
+        uploads.append((ext, data, Path(f.filename or "").stem))
 
     with pool.connection() as conn:
         recent = conn.execute(
@@ -311,8 +378,9 @@ async def create_job(
         if recent >= 10:
             raise HTTPException(429, "Too many jobs this hour. Try again later.")
         job = conn.execute(
-            "INSERT INTO content_jobs (owner_id, instruction, brief, status) VALUES (%s,%s,'','generating') RETURNING id",
-            (user["id"], instruction),
+            "INSERT INTO content_jobs (owner_id, instruction, brief, status, content_type, model_choice) "
+            "VALUES (%s,%s,'','generating',%s,%s) RETURNING id",
+            (user["id"], instruction, content_type, model),
         ).fetchone()
         conn.execute(
             "INSERT INTO audit_log (actor_id, action, job_id) VALUES (%s,'job_created',%s)",
@@ -322,8 +390,11 @@ async def create_job(
     if uploads:
         folder = STORAGE_DIR / "uploads" / f"job_{job['id']}"
         folder.mkdir(parents=True, exist_ok=True)
-        for i, (ext, data) in enumerate(uploads, 1):
-            (folder / f"attachment_{i}{ext}").write_bytes(data)
+        # for i, (ext, data) in enumerate(uploads, 1):
+        #     (folder / f"attachment_{i}{ext}").write_bytes(data)
+        for i, (ext, data, stem) in enumerate(uploads, 1):
+            safe = re.sub(r"[^A-Za-z0-9-]", "", stem)[:30]
+            (folder / f"attachment_{i}_{safe}{ext}").write_bytes(data)
 
     background.add_task(run_agent, pool, job["id"])
     return {"id": job["id"]}

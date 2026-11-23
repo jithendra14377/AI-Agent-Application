@@ -367,8 +367,8 @@ async def create_job(
         total += len(data)
         if len(data) > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
             raise HTTPException(400, "Attachments are too large (9 MB in total).")
-        # uploads.append((ext, data))
-        uploads.append((ext, data, Path(f.filename or "").stem))
+        uploads.append((ext, data))
+        # uploads.append((ext, data, Path(f.filename or "").stem))
 
     with pool.connection() as conn:
         recent = conn.execute(
@@ -390,11 +390,11 @@ async def create_job(
     if uploads:
         folder = STORAGE_DIR / "uploads" / f"job_{job['id']}"
         folder.mkdir(parents=True, exist_ok=True)
-        # for i, (ext, data) in enumerate(uploads, 1):
-        #     (folder / f"attachment_{i}{ext}").write_bytes(data)
-        for i, (ext, data, stem) in enumerate(uploads, 1):
-            safe = re.sub(r"[^A-Za-z0-9-]", "", stem)[:30]
-            (folder / f"attachment_{i}_{safe}{ext}").write_bytes(data)
+        for i, (ext, data) in enumerate(uploads, 1):
+            (folder / f"attachment_{i}{ext}").write_bytes(data)
+        # for i, (ext, data, stem) in enumerate(uploads, 1):
+        #     safe = re.sub(r"[^A-Za-z0-9-]", "", stem)[:30]
+        #     (folder / f"attachment_{i}_{safe}{ext}").write_bytes(data)
 
     background.add_task(run_agent, pool, job["id"])
     return {"id": job["id"]}

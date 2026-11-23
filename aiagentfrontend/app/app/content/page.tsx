@@ -200,7 +200,7 @@ import { FileText, Plus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 
-type Step = { id: number; step_no: number; tool_name: string; status: "running" | "done" | "failed"; output: { error?: string; summary?: string } | null };
+type Step = { id: number; step_no: number; tool_name: string; status: "running" | "done" | "failed"; output: { error?: string } | null };
 type Job = {
   id: number; status: string; seo_title: string | null; description: string | null;
   hashtags: string[]; copy_by_platform: Record<string, string>;
@@ -213,9 +213,9 @@ const LABEL: Record<string, string> = {
   read_inputs: "Reading your attachments and links",
   write_copy: "Writing SEO title, description and hashtags",
   generate_image: "Creating a scene image",
-  // generate_video: "Building the video (up to 20 seconds)",
-  plan_content: "Understanding your request",
-  generate_video: "Generating the AI video (this can take a few minutes)",
+  generate_video: "Building the video (up to 20 seconds)",
+  // plan_content: "Understanding your request",
+  // generate_video: "Generating the AI video (this can take a few minutes)",
   submit_for_approval: "Submitting for manager approval",
   agent_error: "Agent error",
 };
@@ -332,7 +332,7 @@ export default function ContentPage() {
           {models.map((m) => <option key={m.id} value={m.id} className={opt}>{m.label}</option>)}
         </select>
         <p className="mt-1 text-[11px] text-violet-200/50">
-          Images: FLUX.1 schnell · Video: Magic Hour AI video. If the chosen model is busy, another one takes over.
+          Images: FLUX.1 schnell · Video: storyboard built with ffmpeg. If the chosen model is busy, another one takes over.
         </p>
 
         <div className="mt-3 rounded-xl border border-violet-400/40 bg-white/5 focus-within:border-cyan-300">
@@ -383,7 +383,6 @@ export default function ContentPage() {
                 <li key={s.id}>
                   {ICON[s.status]} {LABEL[s.tool_name] ?? s.tool_name}
                   {s.output?.error && <div className="ml-6 text-xs text-red-300">{s.output.error}</div>}
-                  {s.output?.summary && <div className="ml-6 text-xs text-cyan-200/80">{s.output.summary}</div>}
                 </li>
               ))}
             </ul>

@@ -3,7 +3,7 @@ import { notFound, useParams } from "next/navigation";
 
 
 // const SECTIONS = ["agents", "analytics", "integrations", "settings"];
-const SECTIONS = ["agents", "integrations", "settings"];
+const SECTIONS = [ "integrations"];
 
 export default function SectionPage() {
   const { section } = useParams<{ section: string }>();

@@ -8,6 +8,7 @@ import {
   ShieldCheck, SlidersHorizontal, Sparkles, Sun, Upload, User, Users, X, Zap,
 } from "lucide-react";
 import { api } from "@/lib/api";
+import { applyTheme, type ThemePref } from "@/lib/theme";
 
 type Prefs = { theme: string; notifications: Record<string, boolean> };
 type Workspace = {
@@ -103,7 +104,7 @@ export default function SettingsPage() {
       setTheme(d.me.prefs.theme); setColors(d.workspace.brand_colors); setFont(d.workspace.brand_font); setHasLogo(d.has_logo);
       loadTeam();
       if (d.me.role === "manager") api<AuditRow[]>("/audit").then(setAudit).catch(() => {});
-    }  catch (e) { setNote({ ok: false, text: "Settings could not be loaded: " + (e as Error).message }); }
+    } catch { setNote({ ok: false, text: "Settings could not be loaded." }); }
   }, [loadTeam]);
   useEffect(() => { load(); }, [load]);
 
@@ -114,6 +115,7 @@ export default function SettingsPage() {
     finally { setBusy(false); }
   }
   const put = (path: string, body: unknown) => api(path, { method: "PUT", body: JSON.stringify(body) });
+  const pickTheme = (k: ThemePref) => { setTheme(k); applyTheme(k); put("/settings/me", { theme: k }).catch(() => {}); };
   const go = (id: string) => { setActive(id); document.getElementById(`set-${id}`)?.scrollIntoView({ behavior: "smooth", block: "start" }); };
 
   const saveGeneral = () => run("Settings saved.", async () => {
@@ -203,7 +205,7 @@ export default function SettingsPage() {
                   <span className="mb-1 block text-xs text-violet-200/80">Theme</span>
                   <div className="grid grid-cols-3 gap-2">
                     {([["light", "Light", Sun], ["dark", "Dark", Moon], ["system", "System", Monitor]] as const).map(([k, l, Icon]) => (
-                      <button key={k} type="button" disabled={k !== "dark"} title={k !== "dark" ? "Only the dark theme is available for now" : ""} onClick={() => setTheme(k)}
+                      <button key={k} type="button" onClick={() => pickTheme(k)}
                         className={`flex h-10 items-center justify-center gap-2 rounded-lg border text-sm ${theme === k ? "sf-nav-active" : "border-violet-400/40 bg-white/5"} disabled:opacity-40`}>
                         <Icon className="h-4 w-4" />{l}</button>
                     ))}

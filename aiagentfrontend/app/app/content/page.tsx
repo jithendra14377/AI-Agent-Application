@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { BrandLogo, type Brand } from "@/components/BrandLogo";
 import { api } from "@/lib/api";
+import { ContentActions } from "@/components/ContentActions";
 
 type Step = { id: number; step_no: number; tool_name: string; status: "running" | "done" | "failed"; output: { error?: string; summary?: string } | null };
 type Job = {
@@ -117,6 +118,16 @@ export default function ContentStudio() {
   const loadJobs = useCallback(() => {
     api<JobItem[]>("/jobs").then(setJobs).catch(() => {});
   }, []);
+
+    const afterChange = useCallback(() => {
+    loadJobs();
+    if (jobId) api<Job>(`/jobs/${jobId}`).then(setJob).catch(() => {});
+  }, [jobId, loadJobs]);
+
+  const afterDelete = useCallback((id: number) => {
+    loadJobs();
+    if (id === jobId) { setJob(null); setJobId(null); }
+  }, [jobId, loadJobs]);
 
   useEffect(() => {
     api<CType[]>("/content-types").then(setTypes).catch(() => {});
@@ -257,25 +268,33 @@ export default function ContentStudio() {
         <p className="py-6 text-center text-sm text-violet-200/70">{jobs.length === 0 ? "No content yet. Create your first one above." : "Nothing matches these filters."}</p>
       ) : (
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 2xl:grid-cols-6">
-          {filtered.map((j) => {
+                    {filtered.map((j) => {
             const b = BADGE[j.status] ?? BADGE.draft;
             return (
-              <button key={j.id} type="button" onClick={() => openJob(j.id)}
-                className="overflow-hidden rounded-xl border border-violet-400/30 bg-white/5 text-left transition hover:border-fuchsia-400/70">
-                <div className="relative aspect-video bg-gradient-to-br from-purple-700/60 to-cyan-600/40">
-                  {j.thumb && <img src={`/api/assets/${j.thumb}/file`} alt="" className="h-full w-full object-cover" />}
-                  {j.has_video && <Film className="absolute right-2 top-2 h-4 w-4 drop-shadow" />}
-                  <div className="absolute inset-x-0 bottom-0 line-clamp-2 bg-gradient-to-t from-black/85 to-transparent p-2 text-xs font-semibold leading-tight">
-                    {j.seo_title || j.instruction}
+              <div key={j.id} className="relative rounded-xl border border-violet-400/30 bg-white/5 transition hover:border-fuchsia-400/70">
+                <button type="button" onClick={() => openJob(j.id)} className="block w-full overflow-hidden rounded-xl text-left">
+                  <div className="relative aspect-video bg-gradient-to-br from-purple-700/60 to-cyan-600/40">
+                    {j.thumb && (
+                      <img src={`/api/assets/${j.thumb}/file`} alt="" className="h-full w-full object-cover"
+                        onError={(e) => { e.currentTarget.style.display = "none"; }} />
+                    )}
+                    {j.has_video && <Film className="absolute left-2 top-2 h-4 w-4 drop-shadow" />}
+                    <div className="absolute inset-x-0 bottom-0 line-clamp-2 bg-gradient-to-t from-black/85 to-transparent p-2 text-xs font-semibold leading-tight">
+                      {j.seo_title || j.instruction}
+                    </div>
                   </div>
+                  <div className="flex items-center justify-between px-2 py-1.5">
+                    <span className={`rounded-full px-2 py-0.5 text-[11px] ${b.cls}`}>{b.label}</span>
+                    <span className="text-[10px] text-violet-200/50">
+                      {new Date(j.created_at).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}
+                    </span>
+                  </div>
+                </button>
+                <div className="absolute right-2 top-2 z-10">
+                  <ContentActions variant="card" job={{ id: j.id, status: j.status, title: j.seo_title }}
+                    onChanged={afterChange} onDeleted={afterDelete} />
                 </div>
-                <div className="flex items-center justify-between px-2 py-1.5">
-                  <span className={`rounded-full px-2 py-0.5 text-[11px] ${b.cls}`}>{b.label}</span>
-                  <span className="text-[10px] text-violet-200/50">
-                    {new Date(j.created_at).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}
-                  </span>
-                </div>
-              </button>
+              </div>
             );
           })}
         </div>
@@ -446,10 +465,10 @@ export default function ContentStudio() {
                       className="flex items-center gap-1.5 rounded-lg border border-violet-400/40 bg-white/5 px-3 py-1.5 hover:bg-white/10 disabled:opacity-50">
                       <RefreshCw className="h-3.5 w-3.5" /> Regenerate
                     </button>
-                    <button type="button" disabled title="Editing arrives with the approval step"
+                    {/* <button type="button" disabled title="Editing arrives with the approval step"
                       className="flex items-center gap-1.5 rounded-lg border border-violet-400/40 bg-white/5 px-3 py-1.5 opacity-50">
                       <Pencil className="h-3.5 w-3.5" /> Edit
-                    </button>
+                    </button> */}
                     <details className="relative">
                       <summary className={`flex list-none items-center gap-1.5 rounded-lg border border-violet-400/40 bg-white/5 px-3 py-1.5 ${job && job.assets.length ? "cursor-pointer hover:bg-white/10" : "pointer-events-none opacity-50"}`}>
                         <Download className="h-3.5 w-3.5" /> Download
@@ -459,6 +478,10 @@ export default function ContentStudio() {
                           <a key={a.id} href={`/api/assets/${a.id}/file?download=1`}
                             className="block rounded px-3 py-1.5 hover:bg-white/10">
                             {a.kind === "video" ? "Video" : `Image ${i + 1}`}
+                                                {job && (
+                      <ContentActions job={{ id: job.id, status: job.status, title: job.seo_title }}
+                        onChanged={afterChange} onDeleted={afterDelete} />
+                    )}
                           </a>
                         ))}
                       </div>

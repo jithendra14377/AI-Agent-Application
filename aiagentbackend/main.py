@@ -31,12 +31,20 @@ pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=False,
                       kwargs={"row_factory": dict_row})
 
 
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+#     pool.open(wait=True)
+#     yield
+#     pool.close()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    for sub in ("", "uploads", "brand", "avatars"):
+        (STORAGE_DIR / sub).mkdir(parents=True, exist_ok=True)
+    print(f"[storage] images, videos and uploads are saved in: {STORAGE_DIR}")
     pool.open(wait=True)
     yield
     pool.close()
-
 
 app = FastAPI(title="SocialFlow AI API", lifespan=lifespan)
 app.add_middleware(
@@ -449,7 +457,7 @@ def get_job_or_404(job_id: int, user: dict):
     with pool.connection() as conn:
         job = conn.execute(
             "SELECT id, owner_id, status, instruction, seo_title, description, hashtags, "
-            "copy_by_platform, created_at FROM content_jobs WHERE id = %s",
+            "copy_by_platform, created_at,rejection_reason  FROM content_jobs WHERE id = %s",
             (job_id,),
         ).fetchone()
     if not job or (job["owner_id"] != user["id"] and user["role"] not in MANAGER_ROLES):
@@ -549,6 +557,9 @@ def list_jobs(user=Depends(current_user)):
             """,
             (user["id"],),
         ).fetchall()
+        bad = _missing_jobs(conn, [r["id"] for r in rows])
+    for r in rows:
+        r["missing_files"] = r["id"] in bad
     return rows
 
 
@@ -560,9 +571,14 @@ def read_job(job_id: int, user=Depends(current_user)):
             "SELECT id, step_no, tool_name, status, output FROM job_steps WHERE job_id=%s ORDER BY step_no",
             (job_id,),
         ).fetchall()
-        assets = conn.execute(
-            "SELECT id, kind FROM assets WHERE job_id=%s ORDER BY id", (job_id,)
+        raw = conn.execute(
+            "SELECT id, kind, storage_path FROM assets WHERE job_id=%s ORDER BY id", (job_id,)
         ).fetchall()
+    root = STORAGE_DIR.resolve()
+    assets = []
+    for a in raw:
+        f = (STORAGE_DIR / a["storage_path"]).resolve()
+        assets.append({"id": a["id"], "kind": a["kind"], "missing": not (f.is_relative_to(root) and f.is_file())})
     return {**job, "steps": steps, "assets": assets}
 
 
@@ -708,19 +724,101 @@ def duplicate_job(job_id: int, user=Depends(require_user)):
         audit(conn, user["id"], "job_duplicated", new["id"], {"from": job_id})
     return {"id": new["id"]}
 
-
 @app.delete("/api/jobs/{job_id}")
 def delete_job(job_id: int, user=Depends(current_user)):
     job = get_job_or_404(job_id, user)
     if job["status"] == "generating":
         raise HTTPException(409, "The agent is still working on this. Wait for it to finish.")
+    root = STORAGE_DIR.resolve()
     with pool.connection() as conn:
+        paths = [r["storage_path"] for r in conn.execute(
+            "SELECT storage_path FROM assets WHERE job_id=%s", (job_id,)).fetchall()]
         audit(conn, user["id"], "job_deleted", None, {"job_id": job_id, "title": job["seo_title"]})
-        conn.execute("DELETE FROM content_jobs WHERE id=%s", (job_id,))
-    shutil.rmtree(STORAGE_DIR / f"job_{job_id}", ignore_errors=True)
-    shutil.rmtree(STORAGE_DIR / "uploads" / f"job_{job_id}", ignore_errors=True)
-    return {"ok": True}
+        conn.execute("DELETE FROM content_jobs WHERE id=%s", (job_id,))  # steps, assets and posts go with it
 
+    removed = 0
+    for rel in paths:  # every file the database knew about
+        p = (STORAGE_DIR / rel).resolve()
+        if p.is_relative_to(root) and p.is_file():
+            try:
+                p.unlink()
+                removed += 1
+            except OSError:
+                pass
+    for folder in (STORAGE_DIR / f"job_{job_id}", STORAGE_DIR / "uploads" / f"job_{job_id}"):
+        if folder.is_dir():  # anything else left in this content's folders
+            removed += sum(1 for f in folder.rglob("*") if f.is_file())
+            shutil.rmtree(folder, ignore_errors=True)
+    return {"ok": True, "files_removed": removed}
+# @app.delete("/api/jobs/{job_id}")
+# def delete_job(job_id: int, user=Depends(current_user)):
+#     job = get_job_or_404(job_id, user)
+#     if job["status"] == "generating":
+#         raise HTTPException(409, "The agent is still working on this. Wait for it to finish.")
+#     with pool.connection() as conn:
+#         audit(conn, user["id"], "job_deleted", None, {"job_id": job_id, "title": job["seo_title"]})
+#         conn.execute("DELETE FROM content_jobs WHERE id=%s", (job_id,))
+#     shutil.rmtree(STORAGE_DIR / f"job_{job_id}", ignore_errors=True)
+#     shutil.rmtree(STORAGE_DIR / "uploads" / f"job_{job_id}", ignore_errors=True)
+#     return {"ok": True}
+
+# ---------------- Edit content text ----------------
+class JobEdit(BaseModel):
+    seo_title: str | None = None
+    description: str | None = None
+    hashtags: list[str] | None = None
+    copy_by_platform: dict[str, str] | None = None
+
+
+EDITABLE_STATUSES = ("draft", "rejected", "pending_approval")
+
+
+@app.patch("/api/jobs/{job_id}")
+def edit_job(job_id: int, body: JobEdit, user=Depends(current_user)):
+    job = get_job_or_404(job_id, user)
+    if job["owner_id"] != user["id"]:
+        raise HTTPException(403, "Only the author can edit this content.")
+    if job["status"] not in EDITABLE_STATUSES:
+        raise HTTPException(409, "Only drafts, rejected items and items awaiting approval can be edited.")
+
+    title, desc = job["seo_title"], job["description"]
+    tags, copy = list(job["hashtags"] or []), dict(job["copy_by_platform"] or {})
+
+    if body.seo_title is not None:
+        title = body.seo_title.strip()
+        if not 3 <= len(title) <= 200:
+            raise HTTPException(400, "The title must be 3 to 200 characters.")
+    if body.description is not None:
+        desc = body.description.strip()
+        if not 1 <= len(desc) <= 5000:
+            raise HTTPException(400, "The description must be 1 to 5000 characters.")
+    if body.hashtags is not None:
+        tags = []
+        for h in body.hashtags[:30]:
+            h = "#" + "".join(ch for ch in h if ch.isalnum() or ch == "_")
+            if len(h) > 1 and h not in tags:
+                tags.append(h)
+        if not tags:
+            raise HTTPException(400, "Add at least one hashtag.")
+    if body.copy_by_platform is not None:
+        for p, text in body.copy_by_platform.items():
+            if p not in PLATFORMS:
+                raise HTTPException(400, f"Unknown platform: {p}.")
+            text = text.strip()
+            if len(text) > 3000:
+                raise HTTPException(400, f"The {p} caption is too long (3000 characters maximum).")
+            if p == "x" and len(text) > 280:
+                raise HTTPException(400, "The X caption must be 280 characters or fewer.")
+            copy[p] = text
+
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE content_jobs SET seo_title=%s, description=%s, hashtags=%s, copy_by_platform=%s, "
+            "updated_at=NOW() WHERE id=%s",
+            (title, desc, tags, Jsonb(copy), job_id),
+        )
+        audit(conn, user["id"], "job_edited", job_id)
+    return {"ok": True}
 
 # ---------------- Assets (images and videos) ----------------
 @app.get("/api/assets/{asset_id}/file")
@@ -1184,4 +1282,84 @@ def admin_overview(month: str | None = None, user=Depends(require_super)):
     return data
 
 
+# ---------------- Edit and clean up content ----------------
+def _missing_jobs(conn, ids: list) -> set:
+    """Ids of jobs that have at least one image or video file missing from the storage folder."""
+    if not ids:
+        return set()
+    root = STORAGE_DIR.resolve()
+    bad = set()
+    for p in conn.execute("SELECT job_id, storage_path FROM assets WHERE job_id = ANY(%s)", (ids,)).fetchall():
+        f = (STORAGE_DIR / p["storage_path"]).resolve()
+        if not f.is_relative_to(root) or not f.is_file():
+            bad.add(p["job_id"])
+    return bad
 
+
+class JobEdit(BaseModel):
+    seo_title: str | None = None
+    description: str | None = None
+    hashtags: list[str] | None = None
+    copy_by_platform: dict[str, str] | None = None
+
+
+@app.put("/api/jobs/{job_id}")
+def edit_job(job_id: int, body: JobEdit, user=Depends(current_user)):
+    job = get_job_or_404(job_id, user)
+    if job["status"] in ("generating", "publishing", "published"):
+        raise HTTPException(409, "This item cannot be edited right now.")
+    title, desc, tags = job["seo_title"], job["description"], job["hashtags"]
+    copy = dict(job["copy_by_platform"] or {})
+    if body.seo_title is not None:
+        title = body.seo_title.strip()
+        if not 5 <= len(title) <= 200:
+            raise HTTPException(400, "The title must be 5 to 200 characters.")
+    if body.description is not None:
+        desc = body.description.strip()
+        if not 10 <= len(desc) <= 3000:
+            raise HTTPException(400, "The description must be 10 to 3000 characters.")
+    if body.hashtags is not None:
+        tags = []
+        for t in body.hashtags:
+            t = "#" + "".join(ch for ch in t if ch.isalnum() or ch == "_")
+            if len(t) > 2 and t not in tags:
+                tags.append(t)
+        if not 1 <= len(tags) <= 15:
+            raise HTTPException(400, "Use 1 to 15 valid hashtags.")
+    if body.copy_by_platform is not None:
+        for p, text in body.copy_by_platform.items():
+            if p not in PLATFORMS:
+                raise HTTPException(400, "Unknown platform.")
+            text = text.strip()
+            if len(text) > 3000 or (p == "x" and len(text) > 280):
+                raise HTTPException(400, f"The {p} caption is too long." + (" X allows 280 characters." if p == "x" else ""))
+            copy[p] = text
+    resend = job["status"] == "approved"   # changed text must be approved again
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE content_jobs SET seo_title=%s, description=%s, hashtags=%s, copy_by_platform=%s, updated_at=NOW() WHERE id=%s",
+            (title, desc, tags, Jsonb(copy), job_id),
+        )
+        if resend:
+            conn.execute(
+                "UPDATE content_jobs SET status='pending_approval', scheduled_at=NULL, scheduled_platform=NULL, "
+                "approved_by=NULL, approved_at=NULL WHERE id=%s", (job_id,),
+            )
+        audit(conn, user["id"], "job_edited", job_id, {"sent_back": resend})
+    return {"ok": True, "sent_back_for_approval": resend}
+
+
+@app.post("/api/jobs/cleanup-missing")
+def cleanup_missing(user=Depends(current_user)):
+    """Delete this user's items whose image or video files are gone from the storage folder."""
+    with pool.connection() as conn:
+        ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM content_jobs WHERE owner_id=%s AND status <> 'generating'", (user["id"],)).fetchall()]
+        bad = sorted(_missing_jobs(conn, ids))
+        if bad:
+            conn.execute("DELETE FROM content_jobs WHERE id = ANY(%s)", (bad,))
+            audit(conn, user["id"], "jobs_cleaned_up", None, {"count": len(bad)})
+    for jid in bad:
+        shutil.rmtree(STORAGE_DIR / f"job_{jid}", ignore_errors=True)
+        shutil.rmtree(STORAGE_DIR / "uploads" / f"job_{jid}", ignore_errors=True)
+    return {"removed": len(bad)}

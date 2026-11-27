@@ -1,9 +1,9 @@
-import asyncio, os, re, time, uuid
+import asyncio, os, re, shutil, time, uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 import mimetypes
-import shutil
 import bcrypt, jwt, psycopg
 
 from dotenv import load_dotenv
@@ -11,11 +11,12 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel
-# from agent import model_options, run_agent
-from agent import brains, model_options, provider_name, run_agent
+from agent import PLATFORMS, brains, model_options, provider_name, run_agent
 from content_types import CONTENT_TYPES
+
 BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR / "storage"
 load_dotenv()
@@ -23,6 +24,8 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 SECRET = os.environ["JWT_SECRET"]
 COOKIE = "sf_token"
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+MANAGER_ROLES = ("super_admin",)  # a super admin can do everything a manager can
+START_TIME = time.time()
 
 pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=10, open=False,
                       kwargs={"row_factory": dict_row})
@@ -63,25 +66,37 @@ class SignupIn(BaseModel):
 
 
 # ---------------- helpers ----------------
-def make_token(user_id: int, days: int) -> str:
-    return jwt.encode({"sub": str(user_id), "exp": int(time.time()) + days * 86400},
+def make_token(kind: str, account_id: int, days: int) -> str:
+    prefix = "a" if kind == "admin" else "u"
+    return jwt.encode({"sub": f"{prefix}:{account_id}", "exp": int(time.time()) + days * 86400},
                       SECRET, algorithm="HS256")
 
 
-def get_user(user_id: int):
+def get_account(kind: str, account_id: int):
+    """Users live in `users`. Super admins live in `superadmins` and get a NEGATIVE id inside the app,
+    so an admin can never be mistaken for a user (users always have positive ids)."""
     with pool.connection() as conn:
-        return conn.execute(
-            "SELECT id, name, email, plan, role FROM users WHERE id = %s AND is_active",
-            (user_id,),
-        ).fetchone()
+        if kind == "admin":
+            row = conn.execute("SELECT id, name, email FROM superadmins WHERE id = %s AND is_active",
+                               (account_id,)).fetchone()
+            if not row:
+                return None
+            return {"id": -row["id"], "name": row["name"], "email": row["email"],
+                    "plan": "Super Admin", "role": "super_admin", "kind": "admin"}
+        row = conn.execute("SELECT id, name, email, plan, role FROM users WHERE id = %s AND is_active",
+                           (account_id,)).fetchone()
+    return {**row, "kind": "user"} if row else None
 
 
 def read_token(token: str):
     try:
-        uid = int(jwt.decode(token, SECRET, algorithms=["HS256"])["sub"])
+        sub = str(jwt.decode(token, SECRET, algorithms=["HS256"])["sub"])
+        kind, _, num = sub.partition(":")
+        if not num:  # old sessions had no kind: treat them as a normal user
+            kind, num = "u", sub
+        return get_account("admin" if kind == "a" else "user", int(num))
     except Exception:
         return None
-    return get_user(uid)
 
 
 def current_user(request: Request):
@@ -90,24 +105,52 @@ def current_user(request: Request):
         raise HTTPException(401, "Not authenticated")
     return user
 
+
 def require_manager(user=Depends(current_user)):
-    if user["role"] != "manager":
+    if user["role"] not in MANAGER_ROLES:
         raise HTTPException(403, "Only managers can do this.")
     return user
 
-def set_login_cookie(response: Response, user_id: int, remember: bool):
+
+def require_super(user=Depends(current_user)):
+    if user["role"] != "super_admin":
+        raise HTTPException(403, "Only the super admin can open this.")
+    return user
+
+def require_user(user=Depends(current_user)):
+    if user["kind"] != "user":
+        raise HTTPException(403, "This is only for normal user accounts.")
+    return user
+
+def set_login_cookie(response: Response, kind: str, account_id: int, remember: bool):
     days = 30 if remember else 1
     response.set_cookie(
-        COOKIE, make_token(user_id, days), httponly=True, samesite="lax",
+        COOKIE, make_token(kind, account_id, days), httponly=True, samesite="lax",
         secure=False,  # set True when the site runs on HTTPS
         max_age=days * 86400 if remember else None,
     )
 
 
-# def public(u: dict):
-#     return {"name": u["name"], "email": u["email"], "plan": u["plan"]}
 def public(u: dict):
     return {"name": u["name"], "email": u["email"], "plan": u["plan"], "role": u["role"]}
+
+
+def audit(conn, actor_id, action, job_id=None, detail=None):
+    """actor_id above 0 is a user. actor_id below 0 is a super admin (their id is -actor_id)."""
+    conn.execute(
+        "INSERT INTO audit_log (actor_id, actor_admin_id, action, job_id, detail) VALUES (%s,%s,%s,%s,%s)",
+        (actor_id if actor_id and actor_id > 0 else None,
+         -actor_id if actor_id and actor_id < 0 else None,
+         action, job_id, Jsonb(detail) if detail else None),
+    )
+
+
+def check_password(pw: str):
+    if len(pw) < 8 or not re.search(r"[A-Za-z]", pw) or not re.search(r"\d", pw):
+        raise HTTPException(400, "Password must be at least 8 characters with a letter and a number.")
+    if len(pw.encode()) > 72:
+        raise HTTPException(400, "Password is too long (maximum 72 bytes).")
+
 
 # ---------------- Auth ----------------
 @app.post("/api/auth/signup")
@@ -120,10 +163,10 @@ def signup(body: SignupIn, response: Response):
         raise HTTPException(400, "Name must be 2 to 100 characters.")
     if not EMAIL_RE.match(email) or len(email) > 255:
         raise HTTPException(400, "Enter a valid email address.")
-    if len(pw) < 8 or not re.search(r"[A-Za-z]", pw) or not re.search(r"\d", pw):
-        raise HTTPException(400, "Password must be at least 8 characters with a letter and a number.")
-    if len(pw.encode()) > 72:
-        raise HTTPException(400, "Password is too long (maximum 72 bytes).")
+    check_password(pw)
+    with pool.connection() as conn:
+        if conn.execute("SELECT 1 FROM superadmins WHERE email=%s", (email,)).fetchone():
+            raise HTTPException(409, "An account with this email already exists.")
 
     pw_hash = bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
     try:
@@ -136,9 +179,37 @@ def signup(body: SignupIn, response: Response):
     except psycopg.errors.UniqueViolation:
         raise HTTPException(409, "An account with this email already exists.")
 
-    set_login_cookie(response, user["id"], False)
+    set_login_cookie(response, "user", user["id"], False)
     return {"user": public(user)}
 
+
+# @app.post("/api/auth/login")
+# def login(body: LoginIn, request: Request, response: Response):
+#     ip = request.client.host if request.client else "unknown"
+#     now = time.time()
+#     FAILS[ip] = [t for t in FAILS[ip] if now - t < 60]
+#     if len(FAILS[ip]) >= 5:
+#         raise HTTPException(429, "Too many attempts. Try again in a minute.")
+
+#     email = body.email.strip().lower()
+#     with pool.connection() as conn:
+#         row = conn.execute(
+#             "SELECT id, name, email, plan, role, password_hash FROM users WHERE email = %s AND is_active",
+#             (email,),
+#         ).fetchone()
+
+#     pw_bytes = body.password.encode()
+#     ok = False
+#     if len(pw_bytes) <= 72:
+#         stored = row["password_hash"] if row else DUMMY_HASH
+#         ok = bcrypt.checkpw(pw_bytes, stored.encode())
+
+#     if not (row and ok):
+#         FAILS[ip].append(now)
+#         raise HTTPException(401, "Incorrect username or password")
+
+#     set_login_cookie(response, row["id"], body.remember)
+#     return {"user": public(row)}
 
 @app.post("/api/auth/login")
 def login(body: LoginIn, request: Request, response: Response):
@@ -149,11 +220,18 @@ def login(body: LoginIn, request: Request, response: Response):
         raise HTTPException(429, "Too many attempts. Try again in a minute.")
 
     email = body.email.strip().lower()
+    kind = "user"
     with pool.connection() as conn:
         row = conn.execute(
             "SELECT id, name, email, plan, role, password_hash FROM users WHERE email = %s AND is_active",
             (email,),
         ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT id, name, email, password_hash FROM superadmins WHERE email = %s AND is_active",
+                (email,),
+            ).fetchone()
+            kind = "admin"
 
     pw_bytes = body.password.encode()
     ok = False
@@ -165,7 +243,13 @@ def login(body: LoginIn, request: Request, response: Response):
         FAILS[ip].append(now)
         raise HTTPException(401, "Incorrect username or password")
 
-    set_login_cookie(response, row["id"], body.remember)
+    if kind == "admin":
+        row = {**row, "plan": "Super Admin", "role": "super_admin"}
+        with pool.connection() as conn:
+            conn.execute("UPDATE superadmins SET last_login_at = NOW() WHERE id = %s", (row["id"],))
+            audit(conn, -row["id"], "admin_login")
+
+    set_login_cookie(response, kind, row["id"], body.remember)
     return {"user": public(row)}
 
 
@@ -179,8 +263,51 @@ def logout(response: Response):
 def me(user=Depends(current_user)):
     return public(user)
 
+class PasswordIn(BaseModel):
+    current: str
+    new: str
 
-# ---------------- Dashboard ----------------
+
+@app.post("/api/auth/change-password")
+def change_password(body: PasswordIn, user=Depends(current_user)):
+    key = f"pw:{user['id']}"
+    now = time.time()
+    FAILS[key] = [t for t in FAILS[key] if now - t < 60]
+    if len(FAILS[key]) >= 5:
+        raise HTTPException(429, "Too many attempts. Try again in a minute.")
+    check_password(body.new)
+    table, acct = ("superadmins", -user["id"]) if user["kind"] == "admin" else ("users", user["id"])
+    with pool.connection() as conn:
+        row = conn.execute(f"SELECT password_hash FROM {table} WHERE id=%s", (acct,)).fetchone()
+        cur_bytes = body.current.encode()
+        if len(cur_bytes) > 72 or not bcrypt.checkpw(cur_bytes, row["password_hash"].encode()):
+            FAILS[key].append(now)
+            raise HTTPException(400, "Your current password is incorrect.")
+        new_hash = bcrypt.hashpw(body.new.encode(), bcrypt.gensalt()).decode()
+        conn.execute(f"UPDATE {table} SET password_hash=%s WHERE id=%s", (new_hash, acct))
+        audit(conn, user["id"], "password_changed", None)
+    return {"ok": True}
+# @app.post("/api/auth/change-password")
+# def change_password(body: "PasswordIn", user=Depends(current_user)):
+#     key = f"pw:{user['id']}"
+#     now = time.time()
+#     FAILS[key] = [t for t in FAILS[key] if now - t < 60]
+#     if len(FAILS[key]) >= 5:
+#         raise HTTPException(429, "Too many attempts. Try again in a minute.")
+#     check_password(body.new)
+#     with pool.connection() as conn:
+#         row = conn.execute("SELECT password_hash FROM users WHERE id=%s", (user["id"],)).fetchone()
+#         cur_bytes = body.current.encode()
+#         if len(cur_bytes) > 72 or not bcrypt.checkpw(cur_bytes, row["password_hash"].encode()):
+#             FAILS[key].append(now)
+#             raise HTTPException(400, "Your current password is incorrect.")
+#         new_hash = bcrypt.hashpw(body.new.encode(), bcrypt.gensalt()).decode()
+#         conn.execute("UPDATE users SET password_hash=%s WHERE id=%s", (new_hash, user["id"]))
+#         audit(conn, user["id"], "password_changed", None)
+#     return {"ok": True}
+
+
+# ---------------- Dashboard and workflows ----------------
 @app.get("/api/dashboard/summary")
 def summary(user=Depends(current_user)):
     return {"agents": 5, "runs_today": 128, "success_rate": 98.4, "tokens_used": 412_500}
@@ -226,6 +353,8 @@ async def run_events(ws: WebSocket, run_id: str):
     except WebSocketDisconnect:
         pass
 
+
+# ---------------- Integrations, activity, health ----------------
 def _set(*names):
     return all(os.environ.get(n, "").strip() for n in names)
 
@@ -287,287 +416,12 @@ def recent_activity(user=Depends(current_user)):
         ).fetchall()
     return rows
 
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
 
 
-# ---------------- Content jobs (AI agent) ----------------
-class JobIn(BaseModel):
-    instruction: str
-    brief: str
-
-
-def get_job_or_404(job_id: int, user: dict):
-    with pool.connection() as conn:
-        job = conn.execute(
-            "SELECT id, owner_id, status, instruction, seo_title, description, hashtags, "
-            "copy_by_platform, created_at FROM content_jobs WHERE id = %s",
-            (job_id,),
-        ).fetchone()
-    if not job or (job["owner_id"] != user["id"] and user["role"] != "manager"):
-        raise HTTPException(404, "Job not found.")
-    return job
-
-
-# @app.post("/api/jobs")
-# def create_job(body: JobIn, background: BackgroundTasks, user=Depends(current_user)):
-#     instruction, brief = body.instruction.strip(), body.brief.strip()
-#     if not 5 <= len(instruction) <= 1000:
-#         raise HTTPException(400, "Instruction must be 5 to 1000 characters.")
-#     if not 10 <= len(brief) <= 8000:
-#         raise HTTPException(400, "Brief must be 10 to 8000 characters.")
-#     with pool.connection() as conn:
-#         recent = conn.execute(
-#             "SELECT COUNT(*) AS n FROM content_jobs WHERE owner_id=%s AND created_at > NOW() - INTERVAL '1 hour'",
-#             (user["id"],),
-#         ).fetchone()["n"]
-#         if recent >= 10:
-#             raise HTTPException(429, "Too many jobs this hour. Try again later.")
-#         job = conn.execute(
-#             "INSERT INTO content_jobs (owner_id, instruction, brief, status) VALUES (%s,%s,%s,'generating') RETURNING id",
-#             (user["id"], instruction, brief),
-#         ).fetchone()
-#         conn.execute(
-#             "INSERT INTO audit_log (actor_id, action, job_id) VALUES (%s,'job_created',%s)",
-#             (user["id"], job["id"]),
-#         )
-#     background.add_task(run_agent, pool, job["id"])
-#     return {"id": job["id"]}
-
-@app.get("/api/content-types")
-def list_content_types(user=Depends(current_user)):
-    return [{"key": k, "label": v["label"], "hint": v["hint"]} for k, v in CONTENT_TYPES.items()]
-
-
-@app.get("/api/models")
-def list_models(user=Depends(current_user)):
-    return model_options()
-
-ALLOWED_UPLOADS = {".png", ".jpg", ".jpeg", ".webp", ".pdf", ".txt", ".md", ".csv"}
-MAX_FILES = 5
-MAX_FILE_BYTES = 8 * 1024 * 1024
-MAX_TOTAL_BYTES = 9 * 1024 * 1024
-
-
-# @app.post("/api/jobs")
-# async def create_job(
-#     background: BackgroundTasks,
-#     instruction: str = Form(...),
-#     files: list[UploadFile] | None = File(default=None),
-#     user=Depends(current_user),
-# ):
-#     instruction = instruction.strip()
-#     if not 5 <= len(instruction) <= 4000:
-#         raise HTTPException(400, "Describe what you want to create (5 to 4000 characters).")
-#     files = files or []
-#     if len(files) > MAX_FILES:
-#         raise HTTPException(400, f"You can attach up to {MAX_FILES} files.")
-
-#     uploads, total = [], 0
-#     for f in files:
-#         ext = Path(f.filename or "").suffix.lower()
-#         if ext not in ALLOWED_UPLOADS:
-#             raise HTTPException(400, "Allowed attachments: images, PDF, TXT, MD and CSV.")
-#         data = await f.read(MAX_FILE_BYTES + 1)
-#         total += len(data)
-#         if len(data) > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
-#             raise HTTPException(400, "Attachments are too large (9 MB in total).")
-#         uploads.append((ext, data))
-
-#     with pool.connection() as conn:
-#         recent = conn.execute(
-#             "SELECT COUNT(*) AS n FROM content_jobs WHERE owner_id=%s AND created_at > NOW() - INTERVAL '1 hour'",
-#             (user["id"],),
-#         ).fetchone()["n"]
-#         if recent >= 10:
-#             raise HTTPException(429, "Too many jobs this hour. Try again later.")
-#         job = conn.execute(
-#             "INSERT INTO content_jobs (owner_id, instruction, brief, status) VALUES (%s,%s,'','generating') RETURNING id",
-#             (user["id"], instruction),
-#         ).fetchone()
-#         conn.execute(
-#             "INSERT INTO audit_log (actor_id, action, job_id) VALUES (%s,'job_created',%s)",
-#             (user["id"], job["id"]),
-#         )
-
-#     if uploads:
-#         folder = STORAGE_DIR / "uploads" / f"job_{job['id']}"
-#         folder.mkdir(parents=True, exist_ok=True)
-#         for i, (ext, data) in enumerate(uploads, 1):
-#             (folder / f"attachment_{i}{ext}").write_bytes(data)
-
-#     background.add_task(run_agent, pool, job["id"])
-#     return {"id": job["id"]}
-
-@app.post("/api/jobs")
-async def create_job(
-    background: BackgroundTasks,
-    instruction: str = Form(...),
-    content_type: str = Form("auto"),
-    model: str = Form("auto"),
-    files: list[UploadFile] | None = File(default=None),
-    user=Depends(current_user),
-):
-    instruction = instruction.strip()
-    if not 5 <= len(instruction) <= 4000:
-        raise HTTPException(400, "Describe what you want to create (5 to 4000 characters).")
-    if content_type not in CONTENT_TYPES:
-        raise HTTPException(400, "Unknown content type.")
-    if model != "auto" and model not in {o["id"] for o in model_options()}:
-        raise HTTPException(400, "That model is not available.")
-    files = files or []
-    if len(files) > MAX_FILES:
-        raise HTTPException(400, f"You can attach up to {MAX_FILES} files.")
-
-    uploads, total = [], 0
-    for f in files:
-        ext = Path(f.filename or "").suffix.lower()
-        if ext not in ALLOWED_UPLOADS:
-            raise HTTPException(400, "Allowed attachments: images, PDF, TXT, MD and CSV.")
-        data = await f.read(MAX_FILE_BYTES + 1)
-        total += len(data)
-        if len(data) > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
-            raise HTTPException(400, "Attachments are too large (9 MB in total).")
-        uploads.append((ext, data))
-        # uploads.append((ext, data, Path(f.filename or "").stem))
-
-    with pool.connection() as conn:
-        recent = conn.execute(
-            "SELECT COUNT(*) AS n FROM content_jobs WHERE owner_id=%s AND created_at > NOW() - INTERVAL '1 hour'",
-            (user["id"],),
-        ).fetchone()["n"]
-        if recent >= 10:
-            raise HTTPException(429, "Too many jobs this hour. Try again later.")
-        job = conn.execute(
-            "INSERT INTO content_jobs (owner_id, instruction, brief, status, content_type, model_choice) "
-            "VALUES (%s,%s,'','generating',%s,%s) RETURNING id",
-            (user["id"], instruction, content_type, model),
-        ).fetchone()
-        conn.execute(
-            "INSERT INTO audit_log (actor_id, action, job_id) VALUES (%s,'job_created',%s)",
-            (user["id"], job["id"]),
-        )
-
-    if uploads:
-        folder = STORAGE_DIR / "uploads" / f"job_{job['id']}"
-        folder.mkdir(parents=True, exist_ok=True)
-        for i, (ext, data) in enumerate(uploads, 1):
-            (folder / f"attachment_{i}{ext}").write_bytes(data)
-        # for i, (ext, data, stem) in enumerate(uploads, 1):
-        #     safe = re.sub(r"[^A-Za-z0-9-]", "", stem)[:30]
-        #     (folder / f"attachment_{i}_{safe}{ext}").write_bytes(data)
-
-    background.add_task(run_agent, pool, job["id"])
-    return {"id": job["id"]}
-
-# @app.get("/api/jobs")
-# def list_jobs(user=Depends(current_user)):
-#     with pool.connection() as conn:
-#         rows = conn.execute(
-#             "SELECT id, status, seo_title, left(instruction, 100) AS instruction, created_at "
-#             "FROM content_jobs WHERE owner_id = %s ORDER BY created_at DESC LIMIT 500",
-#             (user["id"],),
-#         ).fetchall()
-#     return rows
-
-@app.get("/api/jobs")
-def list_jobs(user=Depends(current_user)):
-    with pool.connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT j.id, j.status, j.seo_title, left(j.instruction, 100) AS instruction, j.created_at,
-                   (SELECT a.id FROM assets a WHERE a.job_id = j.id AND a.kind = 'image'
-                    ORDER BY a.id LIMIT 1) AS thumb,
-                   (SELECT COUNT(*) FROM assets a WHERE a.job_id = j.id AND a.kind = 'image') AS images,
-                   EXISTS (SELECT 1 FROM assets a WHERE a.job_id = j.id AND a.kind = 'video') AS has_video,
-                   COALESCE((SELECT s.output->>'aspect_ratio' FROM job_steps s
-                             WHERE s.job_id = j.id AND s.tool_name = 'plan_content' AND s.status = 'done'
-                             ORDER BY s.step_no DESC LIMIT 1), '') AS aspect
-            FROM content_jobs j
-            WHERE j.owner_id = %s
-            ORDER BY j.created_at DESC
-            LIMIT 200
-            """,
-            (user["id"],),
-        ).fetchall()
-    return rows
-
-@app.get("/api/jobs/{job_id}")
-def read_job(job_id: int, user=Depends(current_user)):
-    job = get_job_or_404(job_id, user)
-    with pool.connection() as conn:
-        steps = conn.execute(
-            "SELECT id, step_no, tool_name, status, output FROM job_steps WHERE job_id=%s ORDER BY step_no",
-            (job_id,),
-        ).fetchall()
-        assets = conn.execute(
-            "SELECT id, kind FROM assets WHERE job_id=%s ORDER BY id", (job_id,)
-        ).fetchall()
-    return {**job, "steps": steps, "assets": assets}
-
-
-# ---------------- Assets (images and videos) ----------------
-@app.get("/api/assets/{asset_id}/file")
-def asset_file(asset_id: int, download: int = 0, user=Depends(current_user)):
-    with pool.connection() as conn:
-        asset = conn.execute(
-            "SELECT a.storage_path, a.kind, j.owner_id FROM assets a "
-            "JOIN content_jobs j ON j.id = a.job_id WHERE a.id = %s",
-            (asset_id,),
-        ).fetchone()
-
-    # same answer for "missing" and "not yours", so nobody can probe which IDs exist
-    if not asset or (asset["owner_id"] != user["id"] and user["role"] != "manager"):
-        raise HTTPException(404, "Not found.")
-
-    path = (STORAGE_DIR / asset["storage_path"]).resolve()
-    if not path.is_relative_to(STORAGE_DIR.resolve()) or not path.is_file():
-        raise HTTPException(404, "Not found.")
-
-    media = "video/mp4" if asset["kind"] == "video" else (mimetypes.guess_type(str(path))[0] or "image/jpeg")
-    return FileResponse(path, media_type=media, filename=path.name if download else None)
-
-
-# # ---------------- Assets ----------------
-
-# @app.get("/api/assets/{asset_id}")
-# def asset_file(asset_id: int, user=Depends(current_user)):
-#     with pool.connection() as conn:
-#         asset = conn.execute(
-#             """
-#             SELECT a.storage_path, a.kind
-#             FROM assets a
-#             JOIN content_jobs j ON j.id = a.job_id
-#             WHERE a.id = %s
-#             """,
-#             (asset_id,),
-#         ).fetchone()
-
-#     if not asset:
-#         raise HTTPException(404, "Asset not found")
-
-#     path = (STORAGE_DIR / asset["storage_path"]).resolve()
-
-#     if not path.is_relative_to(STORAGE_DIR.resolve()):
-#         raise HTTPException(403, "Invalid asset path")
-
-#     if not path.is_file():
-#         raise HTTPException(404, "Asset file not found")
-
-#     media = (
-#         "video/mp4"
-#         if asset["kind"] == "video"
-#         else (mimetypes.guess_type(str(path))[0] or "image/jpeg")
-#     )
-
-#     media = "video/mp4" if a["kind"] == "video" else (mimetypes.guess_type(str(path))[0] or "image/jpeg")
-#     return FileResponse(path, media_type=media)
-
-
-# ============================================================================
-# Paste this block at the very END of main.py (after the earlier additions).
-# ============================================================================
 @app.get("/api/agents/status")
 def agents_status(user=Depends(current_user)):
     """Which parts of the agent are ready. Never returns keys, only yes/no and a short note."""
@@ -590,10 +444,307 @@ def agents_status(user=Depends(current_user)):
     }
 
 
-# ============================================================================
-# Paste this block at the very END of main.py (after the earlier additions).
-# It uses audit() from the Calendar block, so that block must already be there.
-# ============================================================================
+# ---------------- Content jobs (AI agent) ----------------
+def get_job_or_404(job_id: int, user: dict):
+    with pool.connection() as conn:
+        job = conn.execute(
+            "SELECT id, owner_id, status, instruction, seo_title, description, hashtags, "
+            "copy_by_platform, created_at FROM content_jobs WHERE id = %s",
+            (job_id,),
+        ).fetchone()
+    if not job or (job["owner_id"] != user["id"] and user["role"] not in MANAGER_ROLES):
+        raise HTTPException(404, "Job not found.")
+    return job
+
+
+@app.get("/api/content-types")
+def list_content_types(user=Depends(current_user)):
+    return [{"key": k, "label": v["label"], "hint": v["hint"]} for k, v in CONTENT_TYPES.items()]
+
+
+@app.get("/api/models")
+def list_models(user=Depends(current_user)):
+    return model_options()
+
+
+ALLOWED_UPLOADS = {".png", ".jpg", ".jpeg", ".webp", ".pdf", ".txt", ".md", ".csv"}
+MAX_FILES = 5
+MAX_FILE_BYTES = 8 * 1024 * 1024
+MAX_TOTAL_BYTES = 9 * 1024 * 1024
+
+
+@app.post("/api/jobs")
+async def create_job(
+    background: BackgroundTasks,
+    instruction: str = Form(...),
+    content_type: str = Form("auto"),
+    model: str = Form("auto"),
+    files: list[UploadFile] | None = File(default=None),
+    user=Depends(require_user),
+):
+    instruction = instruction.strip()
+    if not 5 <= len(instruction) <= 4000:
+        raise HTTPException(400, "Describe what you want to create (5 to 4000 characters).")
+    if content_type not in CONTENT_TYPES:
+        raise HTTPException(400, "Unknown content type.")
+    if model != "auto" and model not in {o["id"] for o in model_options()}:
+        raise HTTPException(400, "That model is not available.")
+    files = files or []
+    if len(files) > MAX_FILES:
+        raise HTTPException(400, f"You can attach up to {MAX_FILES} files.")
+
+    uploads, total = [], 0
+    for f in files:
+        ext = Path(f.filename or "").suffix.lower()
+        if ext not in ALLOWED_UPLOADS:
+            raise HTTPException(400, "Allowed attachments: images, PDF, TXT, MD and CSV.")
+        data = await f.read(MAX_FILE_BYTES + 1)
+        total += len(data)
+        if len(data) > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
+            raise HTTPException(400, "Attachments are too large (9 MB in total).")
+        uploads.append((ext, data))
+
+    with pool.connection() as conn:
+        recent = conn.execute(
+            "SELECT COUNT(*) AS n FROM content_jobs WHERE owner_id=%s AND created_at > NOW() - INTERVAL '1 hour'",
+            (user["id"],),
+        ).fetchone()["n"]
+        if recent >= 10:
+            raise HTTPException(429, "Too many jobs this hour. Try again later.")
+        job = conn.execute(
+            "INSERT INTO content_jobs (owner_id, instruction, brief, status, content_type, model_choice) "
+            "VALUES (%s,%s,'','generating',%s,%s) RETURNING id",
+            (user["id"], instruction, content_type, model),
+        ).fetchone()
+        audit(conn, user["id"], "job_created", job["id"])
+
+    if uploads:
+        folder = STORAGE_DIR / "uploads" / f"job_{job['id']}"
+        folder.mkdir(parents=True, exist_ok=True)
+        for i, (ext, data) in enumerate(uploads, 1):
+            (folder / f"attachment_{i}{ext}").write_bytes(data)
+
+    background.add_task(run_agent, pool, job["id"])
+    return {"id": job["id"]}
+
+
+@app.get("/api/jobs")
+def list_jobs(user=Depends(current_user)):
+    with pool.connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT j.id, j.status, j.seo_title, left(j.instruction, 100) AS instruction, j.created_at,
+                   j.scheduled_at, j.scheduled_platform,
+                   (SELECT a.id FROM assets a WHERE a.job_id = j.id AND a.kind = 'image'
+                    ORDER BY a.id LIMIT 1) AS thumb,
+                   (SELECT COUNT(*) FROM assets a WHERE a.job_id = j.id AND a.kind = 'image') AS images,
+                   EXISTS (SELECT 1 FROM assets a WHERE a.job_id = j.id AND a.kind = 'video') AS has_video,
+                   COALESCE((SELECT s.output->>'aspect_ratio' FROM job_steps s
+                             WHERE s.job_id = j.id AND s.tool_name = 'plan_content' AND s.status = 'done'
+                             ORDER BY s.step_no DESC LIMIT 1), '') AS aspect
+            FROM content_jobs j
+            WHERE j.owner_id = %s
+            ORDER BY j.created_at DESC
+            LIMIT 200
+            """,
+            (user["id"],),
+        ).fetchall()
+    return rows
+
+
+@app.get("/api/jobs/{job_id}")
+def read_job(job_id: int, user=Depends(current_user)):
+    job = get_job_or_404(job_id, user)
+    with pool.connection() as conn:
+        steps = conn.execute(
+            "SELECT id, step_no, tool_name, status, output FROM job_steps WHERE job_id=%s ORDER BY step_no",
+            (job_id,),
+        ).fetchall()
+        assets = conn.execute(
+            "SELECT id, kind FROM assets WHERE job_id=%s ORDER BY id", (job_id,)
+        ).fetchall()
+    return {**job, "steps": steps, "assets": assets}
+
+
+# ---------------- Manager approval and calendar actions ----------------
+class ScheduleIn(BaseModel):
+    scheduled_at: datetime
+    platform: str
+
+
+class RejectIn(BaseModel):
+    reason: str = ""
+
+
+@app.get("/api/approvals")
+def approvals(user=Depends(require_manager)):
+    """Everything waiting for a manager, from all users, oldest first."""
+    with pool.connection() as conn:
+        return conn.execute(
+            """
+            SELECT j.id, j.seo_title, left(j.instruction, 100) AS instruction, j.created_at, u.name AS owner,
+                   (SELECT a.id FROM assets a WHERE a.job_id = j.id AND a.kind = 'image'
+                    ORDER BY a.id LIMIT 1) AS thumb,
+                   EXISTS (SELECT 1 FROM assets a WHERE a.job_id = j.id AND a.kind = 'video') AS has_video
+            FROM content_jobs j JOIN users u ON u.id = j.owner_id
+            WHERE j.status = 'pending_approval'
+            ORDER BY j.created_at
+            """
+        ).fetchall()
+
+
+@app.post("/api/jobs/{job_id}/approve")
+def approve_job(job_id: int, user=Depends(require_manager)):
+    job = get_job_or_404(job_id, user)
+    if job["status"] != "pending_approval":
+        raise HTTPException(409, "Only content that is waiting for approval can be approved.")
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE content_jobs SET status='approved', approved_by_admin=%s, approved_at=NOW(), "
+            "rejection_reason=NULL, updated_at=NOW() WHERE id=%s",
+            (-user["id"], job_id),
+            # "UPDATE content_jobs SET status='approved', approved_by=%s, approved_at=NOW(), "
+            # "rejection_reason=NULL, updated_at=NOW() WHERE id=%s",
+            # (user["id"], job_id),
+        )
+        audit(conn, user["id"], "job_approved", job_id)
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/reject")
+def reject_job(job_id: int, body: RejectIn, user=Depends(require_manager)):
+    job = get_job_or_404(job_id, user)
+    if job["status"] != "pending_approval":
+        raise HTTPException(409, "Only content that is waiting for approval can be rejected.")
+    reason = body.reason.strip()[:500]
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE content_jobs SET status='rejected', rejection_reason=%s, scheduled_at=NULL, "
+            "scheduled_platform=NULL, updated_at=NOW() WHERE id=%s",
+            (reason or None, job_id),
+        )
+        audit(conn, user["id"], "job_rejected", job_id, {"reason": reason})
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/submit")
+def submit_job(job_id: int, user=Depends(current_user)):
+    """Send a draft or rejected item back to the manager."""
+    job = get_job_or_404(job_id, user)
+    if job["status"] not in ("draft", "rejected"):
+        raise HTTPException(409, "Only drafts and rejected items can be sent for approval.")
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE content_jobs SET status='pending_approval', rejection_reason=NULL, updated_at=NOW() WHERE id=%s",
+            (job_id,),
+        )
+        audit(conn, user["id"], "job_resubmitted", job_id)
+    return {"ok": True}
+
+
+@app.put("/api/jobs/{job_id}/schedule")
+def schedule_job(job_id: int, body: ScheduleIn, user=Depends(current_user)):
+    job = get_job_or_404(job_id, user)
+    if job["status"] != "approved":
+        raise HTTPException(409, "Only approved content can be scheduled. A manager must approve it first.")
+    if body.platform not in PLATFORMS:
+        raise HTTPException(400, "Unknown platform.")
+    if body.scheduled_at.tzinfo is None:
+        raise HTTPException(400, "The scheduled time must include a time zone.")
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE content_jobs SET scheduled_at=%s, scheduled_platform=%s, updated_at=NOW() WHERE id=%s",
+            (body.scheduled_at, body.platform, job_id),
+        )
+        audit(conn, user["id"], "job_scheduled", job_id,
+              {"at": body.scheduled_at.isoformat(), "platform": body.platform})
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/draft")
+def move_to_draft(job_id: int, user=Depends(current_user)):
+    job = get_job_or_404(job_id, user)
+    if job["status"] in ("generating", "publishing", "published"):
+        raise HTTPException(409, "This item cannot be moved to draft right now.")
+    with pool.connection() as conn:
+        conn.execute(
+            "UPDATE content_jobs SET status='draft', scheduled_at=NULL, scheduled_platform=NULL, "
+            "approved_by=NULL, approved_at=NULL, updated_at=NOW() WHERE id=%s",
+            (job_id,),
+        )
+        audit(conn, user["id"], "job_moved_to_draft", job_id)
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/duplicate")
+def duplicate_job(job_id: int, user=Depends(require_user)):
+    old = get_job_or_404(job_id, user)
+    if old["status"] == "generating":
+        raise HTTPException(409, "Wait for the agent to finish first.")
+    with pool.connection() as conn:
+        new = conn.execute(
+            "INSERT INTO content_jobs (owner_id, instruction, brief, status, seo_title, description, hashtags, "
+            "copy_by_platform, content_type, model_choice) "
+            "SELECT %s::bigint, instruction, brief, 'draft', seo_title, description, hashtags, "
+            "copy_by_platform, content_type, model_choice FROM content_jobs WHERE id=%s RETURNING id",
+            (user["id"], job_id),
+        ).fetchone()
+        assets = conn.execute(
+            "SELECT kind, storage_path, provider FROM assets WHERE job_id=%s ORDER BY id", (job_id,)
+        ).fetchall()
+        root = STORAGE_DIR.resolve()
+        folder = STORAGE_DIR / f"job_{new['id']}"
+        for a in assets:
+            src = (STORAGE_DIR / a["storage_path"]).resolve()
+            if not src.is_relative_to(root) or not src.is_file():
+                continue
+            folder.mkdir(parents=True, exist_ok=True)
+            dst = folder / src.name
+            shutil.copy2(src, dst)
+            conn.execute(
+                "INSERT INTO assets (job_id, kind, storage_path, provider) VALUES (%s,%s,%s,%s)",
+                (new["id"], a["kind"], str(dst.relative_to(STORAGE_DIR)).replace("\\", "/"), a["provider"]),
+            )
+        audit(conn, user["id"], "job_duplicated", new["id"], {"from": job_id})
+    return {"id": new["id"]}
+
+
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: int, user=Depends(current_user)):
+    job = get_job_or_404(job_id, user)
+    if job["status"] == "generating":
+        raise HTTPException(409, "The agent is still working on this. Wait for it to finish.")
+    with pool.connection() as conn:
+        audit(conn, user["id"], "job_deleted", None, {"job_id": job_id, "title": job["seo_title"]})
+        conn.execute("DELETE FROM content_jobs WHERE id=%s", (job_id,))
+    shutil.rmtree(STORAGE_DIR / f"job_{job_id}", ignore_errors=True)
+    shutil.rmtree(STORAGE_DIR / "uploads" / f"job_{job_id}", ignore_errors=True)
+    return {"ok": True}
+
+
+# ---------------- Assets (images and videos) ----------------
+@app.get("/api/assets/{asset_id}/file")
+def asset_file(asset_id: int, download: int = 0, user=Depends(current_user)):
+    with pool.connection() as conn:
+        asset = conn.execute(
+            "SELECT a.storage_path, a.kind, j.owner_id FROM assets a "
+            "JOIN content_jobs j ON j.id = a.job_id WHERE a.id = %s",
+            (asset_id,),
+        ).fetchone()
+
+    # same answer for "missing" and "not yours", so nobody can probe which IDs exist
+    if not asset or (asset["owner_id"] != user["id"] and user["role"] not in MANAGER_ROLES):
+        raise HTTPException(404, "Not found.")
+
+    path = (STORAGE_DIR / asset["storage_path"]).resolve()
+    if not path.is_relative_to(STORAGE_DIR.resolve()) or not path.is_file():
+        raise HTTPException(404, "Not found.")
+
+    media = "video/mp4" if asset["kind"] == "video" else (mimetypes.guess_type(str(path))[0] or "image/jpeg")
+    return FileResponse(path, media_type=media, filename=path.name if download else None)
+
+
+# ---------------- Settings ----------------
 LANG_OPTS = ["English", "Hindi", "Telugu", "Tamil", "Kannada", "Malayalam", "Marathi", "Bengali", "Gujarati"]
 TZ_OPTS = ["Asia/Kolkata", "UTC", "Asia/Dubai", "Asia/Singapore", "Europe/London",
            "America/New_York", "America/Los_Angeles", "Australia/Sydney"]
@@ -625,12 +776,22 @@ def save_ws(data: dict, user_id: int):
         )
         audit(conn, user_id, "workspace_updated", None)
 
+def _user_settings(conn, uid: int) -> dict:
+    table, acct = ("superadmins", -uid) if uid < 0 else ("users", uid)
+    row = conn.execute(f"SELECT settings FROM {table} WHERE id=%s", (acct,)).fetchone()
+    return (row["settings"] if row else None) or {}
 
-def check_password(pw: str):
-    if len(pw) < 8 or not re.search(r"[A-Za-z]", pw) or not re.search(r"\d", pw):
-        raise HTTPException(400, "Password must be at least 8 characters with a letter and a number.")
-    if len(pw.encode()) > 72:
-        raise HTTPException(400, "Password is too long (maximum 72 bytes).")
+
+def _save_user_settings(conn, uid: int, data: dict):
+    table, acct = ("superadmins", -uid) if uid < 0 else ("users", uid)
+    conn.execute(f"UPDATE {table} SET settings=%s WHERE id=%s", (Jsonb(data), acct))
+# def _user_settings(conn, uid: int) -> dict:
+#     row = conn.execute("SELECT settings FROM users WHERE id=%s", (uid,)).fetchone()
+#     return (row["settings"] if row else None) or {}
+
+
+# def _save_user_settings(conn, uid: int, data: dict):
+#     conn.execute("UPDATE users SET settings=%s WHERE id=%s", (Jsonb(data), uid))
 
 
 class WorkspaceIn(BaseModel):
@@ -658,7 +819,7 @@ class TeamIn(BaseModel):
     name: str
     email: str
     password: str
-    role: str = "member"
+    role: str = "user"
 
 
 class TeamUpdate(BaseModel):
@@ -666,12 +827,11 @@ class TeamUpdate(BaseModel):
     is_active: bool | None = None
 
 
-# ---------------- Read everything the Settings screen needs ----------------
 @app.get("/api/settings")
 def read_settings(user=Depends(current_user)):
     with pool.connection() as conn:
-        row = conn.execute("SELECT settings FROM users WHERE id=%s", (user["id"],)).fetchone()
-    mine = {**USER_DEFAULTS, **((row["settings"] if row else None) or {})}
+        mine_raw = _user_settings(conn, user["id"])
+    mine = {**USER_DEFAULTS, **mine_raw}
     mine["notifications"] = {**USER_DEFAULTS["notifications"], **(mine.get("notifications") or {})}
     ws = get_ws()
     return {
@@ -710,8 +870,7 @@ def update_workspace(body: WorkspaceIn, user=Depends(require_manager)):
 @app.put("/api/settings/me")
 def update_me(body: MeIn, user=Depends(current_user)):
     with pool.connection() as conn:
-        row = conn.execute("SELECT settings FROM users WHERE id=%s", (user["id"],)).fetchone()
-        mine = {**USER_DEFAULTS, **((row["settings"] if row else None) or {})}
+        mine = {**USER_DEFAULTS, **_user_settings(conn, user["id"])}
         mine["notifications"] = {**USER_DEFAULTS["notifications"], **(mine.get("notifications") or {})}
         name = None
         if body.name is not None:
@@ -726,29 +885,11 @@ def update_me(body: MeIn, user=Depends(current_user)):
             if any(k not in USER_DEFAULTS["notifications"] for k in body.notifications):
                 raise HTTPException(400, "Unknown notification setting.")
             mine["notifications"] = {**mine["notifications"], **{k: bool(v) for k, v in body.notifications.items()}}
-        conn.execute("UPDATE users SET name=COALESCE(%s, name), settings=%s WHERE id=%s", (name, Jsonb(mine), user["id"]))
+        table, acct = ("superadmins", -user["id"]) if user["id"] < 0 else ("users", user["id"])
+        conn.execute(f"UPDATE {table} SET name=COALESCE(%s, name), settings=%s WHERE id=%s", (name, Jsonb(mine), acct))
+        # conn.execute("UPDATE users SET name=COALESCE(%s, name), settings=%s WHERE id=%s", (name, Jsonb(mine), user["id"]))
         if name:
             audit(conn, user["id"], "profile_updated", None)
-    return {"ok": True}
-
-
-@app.post("/api/auth/change-password")
-def change_password(body: PasswordIn, user=Depends(current_user)):
-    key = f"pw:{user['id']}"
-    now = time.time()
-    FAILS[key] = [t for t in FAILS[key] if now - t < 60]
-    if len(FAILS[key]) >= 5:
-        raise HTTPException(429, "Too many attempts. Try again in a minute.")
-    check_password(body.new)
-    with pool.connection() as conn:
-        row = conn.execute("SELECT password_hash FROM users WHERE id=%s", (user["id"],)).fetchone()
-        cur_bytes = body.current.encode()
-        if len(cur_bytes) > 72 or not bcrypt.checkpw(cur_bytes, row["password_hash"].encode()):
-            FAILS[key].append(now)
-            raise HTTPException(400, "Your current password is incorrect.")
-        new_hash = bcrypt.hashpw(body.new.encode(), bcrypt.gensalt()).decode()
-        conn.execute("UPDATE users SET password_hash=%s WHERE id=%s", (new_hash, user["id"]))
-        audit(conn, user["id"], "password_changed", None)
     return {"ok": True}
 
 
@@ -756,7 +897,7 @@ def change_password(body: PasswordIn, user=Depends(current_user)):
 @app.get("/api/team")
 def team(user=Depends(current_user)):
     with pool.connection() as conn:
-        if user["role"] == "manager":
+        if user["role"] in MANAGER_ROLES:
             return conn.execute("SELECT id, name, email, role, plan, is_active FROM users ORDER BY created_at").fetchall()
         return conn.execute("SELECT id, name, email, role, plan, is_active FROM users WHERE id=%s", (user["id"],)).fetchall()
 
@@ -768,9 +909,12 @@ def add_member(body: TeamIn, user=Depends(require_manager)):
         raise HTTPException(400, "Name must be 2 to 100 characters.")
     if not EMAIL_RE.match(email) or len(email) > 255:
         raise HTTPException(400, "Enter a valid email address.")
-    if body.role not in ("member", "manager"):
+    if body.role != "user":
         raise HTTPException(400, "Role must be member or manager.")
     check_password(body.password)
+    with pool.connection() as conn:
+        if conn.execute("SELECT 1 FROM superadmins WHERE email=%s", (email,)).fetchone():
+            raise HTTPException(409, "An account with this email already exists.")
     pw_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
     try:
         with pool.connection() as conn:
@@ -788,18 +932,25 @@ def add_member(body: TeamIn, user=Depends(require_manager)):
 def update_member(uid: int, body: TeamUpdate, user=Depends(require_manager)):
     if uid == user["id"]:
         raise HTTPException(400, "You cannot change your own role or access.")
-    if body.role is not None and body.role not in ("member", "manager"):
+    if body.role is not None and body.role != "user":
         raise HTTPException(400, "Role must be member or manager.")
     with pool.connection() as conn:
-        if not conn.execute("SELECT 1 FROM users WHERE id=%s", (uid,)).fetchone():
+        target = conn.execute("SELECT role FROM users WHERE id=%s", (uid,)).fetchone()
+        if not target:
             raise HTTPException(404, "Member not found.")
+        if target["role"] == "super_admin" and user["role"] != "super_admin":
+            raise HTTPException(403, "Only a super admin can change a super admin.")
         conn.execute("UPDATE users SET role=COALESCE(%s, role), is_active=COALESCE(%s, is_active) WHERE id=%s",
                      (body.role, body.is_active, uid))
         audit(conn, user["id"], "member_updated", None, {"user_id": uid, "role": body.role, "is_active": body.is_active})
     return {"ok": True}
 
 
-# ---------------- Brand logo ----------------
+# ---------------- Brand logo and profile photos ----------------
+def _image_ok(data: bytes) -> bool:
+    return data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff"
+
+
 @app.post("/api/brand/logo")
 async def upload_logo(file: UploadFile = File(...), user=Depends(require_manager)):
     ext = Path(file.filename or "").suffix.lower()
@@ -808,7 +959,7 @@ async def upload_logo(file: UploadFile = File(...), user=Depends(require_manager
     data = await file.read(5 * 1024 * 1024 + 1)
     if len(data) > 5 * 1024 * 1024:
         raise HTTPException(400, "The logo is larger than 5 MB.")
-    if not (data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff"):
+    if not _image_ok(data):
         raise HTTPException(400, "That file is not a real PNG or JPG image.")
     folder = STORAGE_DIR / "brand"
     folder.mkdir(parents=True, exist_ok=True)
@@ -833,12 +984,204 @@ def get_logo(user=Depends(current_user)):
                         headers={"Cache-Control": "no-cache"})
 
 
+@app.post("/api/me/photo")
+async def upload_photo(file: UploadFile = File(...), user=Depends(current_user)):
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in (".png", ".jpg", ".jpeg"):
+        raise HTTPException(400, "Use a PNG or JPG image.")
+    data = await file.read(3 * 1024 * 1024 + 1)
+    if len(data) > 3 * 1024 * 1024:
+        raise HTTPException(400, "The photo is larger than 3 MB.")
+    if not _image_ok(data):
+        raise HTTPException(400, "That file is not a real PNG or JPG image.")
+    folder = STORAGE_DIR / "avatars"
+    folder.mkdir(parents=True, exist_ok=True)
+    for old in folder.glob(f"user_{user['id']}.*"):
+        old.unlink(missing_ok=True)
+    (folder / f"user_{user['id']}{ext}").write_bytes(data)
+    with pool.connection() as conn:
+        s = _user_settings(conn, user["id"])
+        s["photo"] = f"avatars/user_{user['id']}{ext}"
+        _save_user_settings(conn, user["id"], s)
+    return {"ok": True}
+
+
+def _photo_response(uid: int):
+    with pool.connection() as conn:
+        rel = _user_settings(conn, uid).get("photo")
+    if not rel:
+        raise HTTPException(404, "No photo.")
+    path = (STORAGE_DIR / rel).resolve()
+    if not path.is_relative_to(STORAGE_DIR.resolve()) or not path.is_file():
+        raise HTTPException(404, "No photo.")
+    return FileResponse(path, media_type="image/png" if path.suffix == ".png" else "image/jpeg",
+                        headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/me/photo")
+def my_photo(user=Depends(current_user)):
+    return _photo_response(user["id"])
+
+
+@app.get("/api/users/{uid}/photo")
+def user_photo(uid: int, user=Depends(current_user)):
+    return _photo_response(uid)
+
+
 # ---------------- Audit log ----------------
 @app.get("/api/audit")
 def audit_logs(user=Depends(require_manager)):
     with pool.connection() as conn:
         return conn.execute(
-            "SELECT a.id, a.action, a.created_at, u.name AS actor, j.seo_title AS job_title, a.job_id "
+            "SELECT a.id, a.action, a.created_at, COALESCE(u.name, sa.name) AS actor, j.seo_title AS job_title, a.job_id "
             "FROM audit_log a LEFT JOIN users u ON u.id = a.actor_id "
+            "LEFT JOIN superadmins sa ON sa.id = a.actor_admin_id "
             "LEFT JOIN content_jobs j ON j.id = a.job_id ORDER BY a.created_at DESC LIMIT 30"
+            # "SELECT a.id, a.action, a.created_at, u.name AS actor, j.seo_title AS job_title, a.job_id "
+            # "FROM audit_log a LEFT JOIN users u ON u.id = a.actor_id "
+            # "LEFT JOIN content_jobs j ON j.id = a.job_id ORDER BY a.created_at DESC LIMIT 30"
         ).fetchall()
+
+
+# ---------------- Notifications (the bell) ----------------
+@app.get("/api/notifications")
+def notifications(user=Depends(current_user)):
+    with pool.connection() as conn:
+        mine = _user_settings(conn, user["id"])
+        if (mine.get("notifications") or {}).get("in_app") is False:
+            return {"items": [], "unread": 0, "muted": True}
+        items = []
+        if user["role"] in MANAGER_ROLES:
+            for r in conn.execute(
+                "SELECT j.id, COALESCE(j.seo_title, left(j.instruction, 60)) AS title, j.updated_at AS at, u.name AS owner "
+                "FROM content_jobs j JOIN users u ON u.id = j.owner_id "
+                "WHERE j.status = 'pending_approval' ORDER BY j.updated_at DESC LIMIT 10"
+            ).fetchall():
+                items.append({"id": f"a{r['id']}", "kind": "approval", "title": r["title"], "at": r["at"],
+                              "text": f"{r['owner']}'s content is waiting for your approval", "href": "/app/admin/review"})
+        words = {"approved": "was approved", "rejected": "was rejected", "failed": "could not be finished"}
+        for r in conn.execute(
+            "SELECT id, status, COALESCE(seo_title, left(instruction, 60)) AS title, updated_at AS at "
+            "FROM content_jobs WHERE owner_id=%s AND status IN ('approved','rejected','failed') "
+            "AND updated_at > NOW() - INTERVAL '7 days' ORDER BY updated_at DESC LIMIT 10",
+            (user["id"],),
+        ).fetchall():
+            items.append({"id": f"s{r['id']}", "kind": r["status"], "title": r["title"], "at": r["at"],
+                          "text": f"Your content {words[r['status']]}", "href": "/app/content"})
+    items.sort(key=lambda i: i["at"], reverse=True)
+    seen = mine.get("notif_seen_at")
+    seen_dt = datetime.fromisoformat(seen) if seen else None
+    unread = sum(1 for i in items if seen_dt is None or i["at"] > seen_dt)
+    for i in items:
+        i["at"] = i["at"].isoformat()
+    return {"items": items[:15], "unread": unread, "muted": False}
+
+
+@app.post("/api/notifications/seen")
+def notifications_seen(user=Depends(current_user)):
+    with pool.connection() as conn:
+        s = _user_settings(conn, user["id"])
+        s["notif_seen_at"] = datetime.now(timezone.utc).isoformat()
+        _save_user_settings(conn, user["id"], s)
+    return {"ok": True}
+
+
+# ---------------- Super admin overview ----------------
+def _month_bounds(month: str | None):
+    now = datetime.now(timezone.utc)
+    try:
+        y, m = (int(p) for p in month.split("-")) if month else (now.year, now.month)
+        start = datetime(y, m, 1, tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(400, "Month must look like 2026-11.")
+    end = datetime(y + (m == 12), m % 12 + 1, 1, tzinfo=timezone.utc)
+    prev = datetime(y - (m == 1), 12 if m == 1 else m - 1, 1, tzinfo=timezone.utc)
+    return start, end, prev
+
+
+def _pct(cur: int, prev: int):
+    return None if not prev else round((cur - prev) / prev * 100, 1)
+
+
+@app.get("/api/admin/overview")
+def admin_overview(month: str | None = None, user=Depends(require_super)):
+    start, end, prev = _month_bounds(month)
+    days = (end - start).days
+    t0 = time.perf_counter()
+    with pool.connection() as conn:
+        conn.execute("SELECT 1").fetchone()
+        db_ms = round((time.perf_counter() - t0) * 1000)
+
+        def n(q: str, a: tuple = ()):
+            return conn.execute(q, a).fetchone()["n"]
+
+        def between(table: str, a, b):
+            return n(f"SELECT COUNT(*) AS n FROM {table} WHERE created_at >= %s AND created_at < %s", (a, b))
+
+        def daily(table: str):
+            rows = conn.execute(
+                f"SELECT EXTRACT(DAY FROM created_at AT TIME ZONE 'UTC')::int AS d, COUNT(*) AS n FROM {table} "
+                "WHERE created_at >= %s AND created_at < %s GROUP BY 1", (start, end),
+            ).fetchall()
+            out = [0] * days
+            for r in rows:
+                out[r["d"] - 1] = r["n"]
+            return out
+
+        users_total = n("SELECT COUNT(*) AS n FROM users")
+        jobs_total = n("SELECT COUNT(*) AS n FROM content_jobs")
+        assets_total = n("SELECT COUNT(*) AS n FROM assets")
+        data = {
+            "month": start.strftime("%Y-%m"),
+            "days": days,
+            "kpi": {
+                "total_users": users_total,
+                "users_delta": _pct(between("users", start, end), between("users", prev, start)),
+                "active_subs": n("SELECT COUNT(*) AS n FROM users WHERE is_active AND plan <> 'Free Plan'"),
+                "runs": jobs_total,
+                "runs_delta": _pct(between("content_jobs", start, end), between("content_jobs", prev, start)),
+                "content": assets_total,
+                "content_delta": _pct(between("assets", start, end), between("assets", prev, start)),
+            },
+            "series": {"users": daily("users"), "content": daily("content_jobs"), "steps": daily("job_steps")},
+            "plans": conn.execute("SELECT plan, COUNT(*) AS n FROM users GROUP BY plan ORDER BY n DESC").fetchall(),
+            "recent_users": conn.execute(
+                "SELECT id, name, email, plan, role, is_active, created_at FROM users ORDER BY created_at DESC LIMIT 5"
+            ).fetchall(),
+            "activity": conn.execute(
+                "SELECT a.id, a.action, a.created_at, COALESCE(u.name, sa.name) AS actor FROM audit_log a "
+                "LEFT JOIN users u ON u.id = a.actor_id LEFT JOIN superadmins sa ON sa.id = a.actor_admin_id "
+                "ORDER BY a.created_at DESC LIMIT 8"
+                # "SELECT a.id, a.action, a.created_at, u.name AS actor FROM audit_log a "
+                # "LEFT JOIN users u ON u.id = a.actor_id ORDER BY a.created_at DESC LIMIT 8"
+            ).fetchall(),
+            "top": {
+                "images": n("SELECT COUNT(*) AS n FROM assets WHERE kind='image'"),
+                "videos": n("SELECT COUNT(*) AS n FROM assets WHERE kind='video'"),
+                "posts": n("SELECT COUNT(*) AS n FROM content_jobs WHERE seo_title IS NOT NULL"),
+                "carousels": n(
+                    "SELECT COUNT(*) AS n FROM (SELECT j.id FROM content_jobs j JOIN assets a ON a.job_id=j.id AND a.kind='image' "
+                    "GROUP BY j.id HAVING COUNT(*) >= 4 AND NOT EXISTS "
+                    "(SELECT 1 FROM assets v WHERE v.job_id=j.id AND v.kind='video')) t"),
+                "reels": n("SELECT COUNT(DISTINCT job_id) AS n FROM job_steps WHERE tool_name='plan_content' "
+                           "AND status='done' AND output->>'aspect_ratio'='9:16'"),
+            },
+        }
+
+    models = model_options()
+    cf_ok = bool(os.environ.get("CF_ACCOUNT_ID") and os.environ.get("CF_API_TOKEN"))
+    video_ok = bool(os.environ.get("MAGIC_HOUR_API_KEY") or os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg"))
+    storage_ok = STORAGE_DIR.exists() and os.access(STORAGE_DIR, os.W_OK)
+    data["health"] = [
+        {"name": "Application Services", "ok": True, "note": "Running"},
+        {"name": "AI Model Services", "ok": bool(models), "note": f"{len(models)} model(s) ready" if models else "No model key in .env"},
+        {"name": "Media Generation", "ok": cf_ok and video_ok, "note": "Image and video tools ready" if cf_ok and video_ok else "A key or tool is missing"},
+        {"name": "Storage", "ok": storage_ok, "note": "Writable" if storage_ok else "Storage folder is not writable"},
+        {"name": "Database", "ok": True, "note": f"{db_ms} ms"},
+    ]
+    data["uptime_seconds"] = int(time.time() - START_TIME)
+    data["db_ms"] = db_ms
+    return data
+
+
+
